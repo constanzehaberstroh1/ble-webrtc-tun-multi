@@ -791,6 +791,24 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 				defer scancel()
 				defer sdpCancel()
 				defer pconn.Close()
+				defer func() {
+					mainLog.Info("%s Tunnel ended — cleaning up", sTag)
+					adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
+						s.TunnelActive = false
+						s.LiveKitJoined = false
+						s.ConnectedSince = ""
+						if s.ActiveChannels > 0 {
+							s.ActiveChannels--
+						}
+					})
+					client.DiscardCall(cID)
+
+					// End call in router (IN_CALL → IDLE) with stats
+					callRouter.EndCall(account.ID, 0, 0, "SESSION_END")
+
+					client.CleanupMessages()
+					mainLog.Info("%s ✅ Cleanup done", sTag)
+				}()
 
 				// Wait for SDP Offer negotiation
 				select {
@@ -859,23 +877,6 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 						}
 					}
 				}
-
-				mainLog.Info("%s Tunnel ended — cleaning up", sTag)
-				adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
-					s.TunnelActive = false
-					s.LiveKitJoined = false
-					s.ConnectedSince = ""
-					if s.ActiveChannels > 0 {
-						s.ActiveChannels--
-					}
-				})
-				client.DiscardCall(cID)
-
-				// End call in router (IN_CALL → IDLE) with stats
-				callRouter.EndCall(account.ID, 0, 0, "SESSION_END")
-
-				client.CleanupMessages()
-				mainLog.Info("%s ✅ Cleanup done", sTag)
 			}(sessionCtx, sessionCancel, pc, tag, call.CallID, sessionNum, session)
 
 			time.Sleep(1 * time.Second)
