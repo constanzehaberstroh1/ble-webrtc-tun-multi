@@ -126,7 +126,7 @@ func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {
 
 		// Check remote server for cross-role conflict
 		if s.RemoteServerURL != "" {
-			if err := s.checkRemoteRoleConflict(userID, req.Role); err != nil {
+			if err := s.checkRemoteRoleConflict("bale", userID, req.Role); err != nil {
 				writeError(w, http.StatusConflict, err.Error())
 				return
 			}
@@ -150,10 +150,10 @@ func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, acct)
 }
 
-// checkRemoteRoleConflict checks if an account with the given bale_user_id
+// checkRemoteRoleConflict checks if an account with the given external ID/bale_user_id
 // already exists on the remote server with the opposite role.
-func (s *Server) checkRemoteRoleConflict(baleUserID int64, wantRole string) error {
-	path := fmt.Sprintf("/api/sync/check-role?bale_user_id=%d", baleUserID)
+func (s *Server) checkRemoteRoleConflict(providerType string, externalID int64, wantRole string) error {
+	path := fmt.Sprintf("/api/sync/check-role?provider_type=%s&external_id=%d", providerType, externalID)
 	resp, err := s.proxyToRemote("GET", path, nil)
 	if err != nil {
 		return nil // Don't block on remote errors
@@ -173,8 +173,8 @@ func (s *Server) checkRemoteRoleConflict(baleUserID int64, wantRole string) erro
 	}
 
 	if result.Exists && result.Role != wantRole {
-		return fmt.Errorf("account (Bale ID %d) already exists on remote as %s — cannot add as %s",
-			baleUserID, result.Role, wantRole)
+		return fmt.Errorf("account (%s ID %d) already exists on remote as %s — cannot add as %s",
+			providerType, externalID, result.Role, wantRole)
 	}
 	return nil
 }
@@ -182,11 +182,16 @@ func (s *Server) checkRemoteRoleConflict(baleUserID int64, wantRole string) erro
 // pushAccountToRemote pushes a newly created account to the remote server via sync API.
 func (s *Server) pushAccountToRemote(acct *db.Account) {
 	payload := map[string]interface{}{
-		"token":        acct.Token,
-		"role":         acct.Role,
-		"bale_user_id": acct.BaleUserID,
-		"display_name": acct.DisplayName,
-		"phone":        acct.Phone,
+		"token":         acct.Token,
+		"role":          acct.Role,
+		"provider_type": acct.ProviderType,
+		"external_id":   acct.ExternalID,
+		"bale_user_id":  acct.ExternalID, // for backward compatibility
+		"display_name":  acct.DisplayName,
+		"phone":         acct.Phone,
+		"auth_key":      acct.AuthKey,
+		"auth_key_id":   acct.AuthKeyID,
+		"server_salt":   acct.ServerSalt,
 	}
 	body, _ := json.Marshal(payload)
 
@@ -200,9 +205,11 @@ func (s *Server) pushAccountToRemote(acct *db.Account) {
 }
 
 // pushAccountDeleteToRemote notifies the remote server about a deleted account.
-func (s *Server) pushAccountDeleteToRemote(baleUserID int64) {
+func (s *Server) pushAccountDeleteToRemote(providerType string, externalID int64) {
 	payload := map[string]interface{}{
-		"bale_user_id": baleUserID,
+		"provider_type": providerType,
+		"external_id":   externalID,
+		"bale_user_id":  externalID, // for backward compatibility
 	}
 	body, _ := json.Marshal(payload)
 
@@ -212,7 +219,7 @@ func (s *Server) pushAccountDeleteToRemote(baleUserID int64) {
 		return
 	}
 	resp.Body.Close()
-	apiLog.Info("Pushed account delete (Bale %d) to remote server", baleUserID)
+	apiLog.Info("Pushed account delete (%s %d) to remote server", providerType, externalID)
 }
 
 // GET /api/accounts/{id}
@@ -282,7 +289,7 @@ func (s *Server) deleteAccount(w http.ResponseWriter, _ *http.Request, id uint) 
 
 	// Push delete to remote server
 	if s.RemoteServerURL != "" && acct != nil {
-		go s.pushAccountDeleteToRemote(acct.BaleUserID)
+		go s.pushAccountDeleteToRemote(acct.ProviderType, acct.ExternalID)
 	}
 
 	writeOK(w, "account deleted")

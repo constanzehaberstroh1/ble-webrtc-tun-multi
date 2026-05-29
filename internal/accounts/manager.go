@@ -12,19 +12,20 @@ import (
 
 	"github.com/salman/ble-webrtc-tun/internal/bale"
 	"github.com/salman/ble-webrtc-tun/internal/db"
+	"github.com/salman/ble-webrtc-tun/internal/provider"
 )
 
 // accountsLog is declared in health.go
 
-// Manager handles the lifecycle of Bale accounts: add, remove, validate,
+// Manager handles the lifecycle of accounts: add, remove, validate,
 // fetch info, and periodic health checks.
 type Manager struct {
 	database *db.Database
 	mu       sync.RWMutex
 
-	// Active Bale clients keyed by account ID — used for server-side
+	// Active clients keyed by account ID — used for server-side
 	// accounts that need persistent WS connections to receive calls.
-	activeClients map[uint]*bale.Client
+	activeClients map[uint]provider.Client
 	clientMu      sync.RWMutex
 
 	syncStopCh chan struct{}
@@ -34,7 +35,7 @@ type Manager struct {
 func NewManager(database *db.Database) *Manager {
 	m := &Manager{
 		database:      database,
-		activeClients: make(map[uint]*bale.Client),
+		activeClients: make(map[uint]provider.Client),
 		syncStopCh:    make(chan struct{}),
 	}
 	go m.StartPeriodicSync()
@@ -186,11 +187,11 @@ func (m *Manager) GetAccount(id uint) (*db.Account, error) {
 	return m.database.GetAccount(id)
 }
 
-// ---- Bale Client Management ----
+// ---- Client Management ----
 
-// StartClient creates and connects a Bale WS client for a server account.
+// StartClient creates and connects a provider client for a server account.
 // The client stays connected to receive incoming calls.
-func (m *Manager) StartClient(accountID uint) (*bale.Client, error) {
+func (m *Manager) StartClient(accountID uint) (provider.Client, error) {
 	acct, err := m.database.GetAccount(accountID)
 	if err != nil {
 		return nil, fmt.Errorf("account %d not found: %w", accountID, err)
@@ -205,10 +206,31 @@ func (m *Manager) StartClient(accountID uint) (*bale.Client, error) {
 		delete(m.activeClients, accountID)
 	}
 
-	client := bale.NewClient(acct.Token)
+	// Dynamic instantiation via factory registry!
+	factory, ok := provider.GetFactory(provider.ProviderType(acct.ProviderType))
+	if !ok {
+		return nil, fmt.Errorf("no registered factory for provider %q", acct.ProviderType)
+	}
+
+	// Prepare accountData
+	acctData := map[string]interface{}{
+		"token":         acct.Token,
+		"external_id":   acct.ExternalID,
+		"access_hash":   acct.AccessHash,
+		"auth_key":      acct.AuthKey,
+		"auth_key_id":   acct.AuthKeyID,
+		"server_salt":   acct.ServerSalt,
+	}
+
+	client, err := factory.NewClient(acctData)
+	if err != nil {
+		m.database.SetAccountError(accountID, "init: "+err.Error())
+		return nil, fmt.Errorf("initializing client: %w", err)
+	}
+
 	if err := client.Connect(); err != nil {
 		m.database.SetAccountError(accountID, "connect: "+err.Error())
-		return nil, fmt.Errorf("connecting to Bale: %w", err)
+		return nil, fmt.Errorf("connecting to %s: %w", acct.ProviderType, err)
 	}
 	client.StartPingLoop()
 
@@ -216,18 +238,18 @@ func (m *Manager) StartClient(accountID uint) (*bale.Client, error) {
 	m.database.SetAccountStatus(accountID, db.StatusIdle)
 	m.database.TouchAccount(accountID)
 
-	accountsLog.Info("Started Bale client for account %d (BaleID=%d)", accountID, acct.BaleUserID)
+	accountsLog.Info("Started %s client for account %d (ExtID=%d)", acct.ProviderType, accountID, acct.ExternalID)
 	return client, nil
 }
 
-// GetClient returns the active Bale client for an account, or nil.
-func (m *Manager) GetClient(accountID uint) *bale.Client {
+// GetClient returns the active client for an account, or nil.
+func (m *Manager) GetClient(accountID uint) provider.Client {
 	m.clientMu.RLock()
 	defer m.clientMu.RUnlock()
 	return m.activeClients[accountID]
 }
 
-// StopClient disconnects and removes the Bale client for an account.
+// StopClient disconnects and removes the client for an account.
 func (m *Manager) StopClient(accountID uint) {
 	m.clientMu.Lock()
 	defer m.clientMu.Unlock()
@@ -236,11 +258,11 @@ func (m *Manager) StopClient(accountID uint) {
 		client.Close()
 		delete(m.activeClients, accountID)
 		m.database.SetAccountStatus(accountID, db.StatusOffline)
-		accountsLog.Info("Stopped Bale client for account %d", accountID)
+		accountsLog.Info("Stopped client for account %d", accountID)
 	}
 }
 
-// StopAllClients disconnects all active Bale clients.
+// StopAllClients disconnects all active clients.
 func (m *Manager) StopAllClients() {
 	m.clientMu.Lock()
 	defer m.clientMu.Unlock()
@@ -249,11 +271,11 @@ func (m *Manager) StopAllClients() {
 		client.Close()
 		m.database.SetAccountStatus(id, db.StatusOffline)
 	}
-	m.activeClients = make(map[uint]*bale.Client)
-	accountsLog.Info("Stopped all Bale clients")
+	m.activeClients = make(map[uint]provider.Client)
+	accountsLog.Info("Stopped all active clients")
 }
 
-// ActiveClientCount returns the number of connected Bale clients.
+// ActiveClientCount returns the number of connected clients.
 func (m *Manager) ActiveClientCount() int {
 	m.clientMu.RLock()
 	defer m.clientMu.RUnlock()
@@ -264,6 +286,15 @@ func (m *Manager) ActiveClientCount() int {
 
 // fetchAndUpdateInfo temporarily connects to Bale to fetch account details.
 func (m *Manager) fetchAndUpdateInfo(accountID uint, token string, userID int64) error {
+	acct, err := m.database.GetAccount(accountID)
+	if err != nil {
+		return err
+	}
+	if acct.ProviderType != "bale" {
+		// Soroush info is fetched during registration/OTP flow, nothing to do
+		return nil
+	}
+
 	client := bale.NewClient(token)
 	if err := client.Connect(); err != nil {
 		m.database.SetAccountError(accountID, "info fetch connect: "+err.Error())

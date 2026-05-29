@@ -147,38 +147,58 @@ func (s *Server) handleSyncAccountCreated(w http.ResponseWriter, r *http.Request
 	}
 
 	var req struct {
-		Token       string `json:"token"`
-		Role        string `json:"role"`
-		BaleUserID  int64  `json:"bale_user_id"`
-		DisplayName string `json:"display_name"`
-		Phone       string `json:"phone"`
+		Token        string `json:"token"`
+		Role         string `json:"role"`
+		BaleUserID   int64  `json:"bale_user_id"`
+		ProviderType string `json:"provider_type"`
+		ExternalID   int64  `json:"external_id"`
+		DisplayName  string `json:"display_name"`
+		Phone        string `json:"phone"`
+		AuthKey      []byte `json:"auth_key"`
+		AuthKeyID    []byte `json:"auth_key_id"`
+		ServerSalt   []byte `json:"server_salt"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.Token == "" || req.Role == "" || req.BaleUserID == 0 {
-		writeError(w, http.StatusBadRequest, "token, role, and bale_user_id are required")
+	provType := req.ProviderType
+	if provType == "" {
+		provType = "bale"
+	}
+	extID := req.ExternalID
+	if extID == 0 {
+		extID = req.BaleUserID
+	}
+
+	if req.Role == "" || extID == 0 {
+		writeError(w, http.StatusBadRequest, "role and external_id (or bale_user_id) are required")
 		return
 	}
 
 	// Validate: the account should not already exist with the opposite role
-	existing, _ := s.database.GetAccountByBaleUserID(req.BaleUserID)
+	existing, _ := s.database.GetAccountByExternalID(provType, extID)
 	if existing != nil {
 		if existing.Role != req.Role {
 			writeError(w, http.StatusConflict,
-				fmt.Sprintf("account %d already exists as %s, cannot be %s", req.BaleUserID, existing.Role, req.Role))
+				fmt.Sprintf("account %d already exists as %s, cannot be %s", extID, existing.Role, req.Role))
 			return
 		}
 		// Already exists with same role — update token and restore if needed
-		s.database.DB.Unscoped().Model(existing).Updates(map[string]interface{}{
+		updates := map[string]interface{}{
 			"token":      req.Token,
 			"token_hash": db.HashToken(req.Token),
 			"deleted_at": nil,
 			"enabled":    true,
 			"status":     db.StatusIdle,
-		})
+		}
+		if len(req.AuthKey) > 0 {
+			updates["auth_key"] = req.AuthKey
+			updates["auth_key_id"] = req.AuthKeyID
+			updates["server_salt"] = req.ServerSalt
+		}
+		s.database.DB.Unscoped().Model(existing).Updates(updates)
 		if req.DisplayName != "" || req.Phone != "" {
 			s.database.UpdateAccountInfo(existing.ID, req.DisplayName, req.Phone, 0)
 		}
@@ -191,16 +211,22 @@ func (s *Server) handleSyncAccountCreated(w http.ResponseWriter, r *http.Request
 	}
 
 	// Also check soft-deleted
-	existingUnscoped, _ := s.database.GetAccountByBaleUserIDUnscoped(req.BaleUserID)
+	existingUnscoped, _ := s.database.GetAccountByExternalIDUnscoped(provType, extID)
 	if existingUnscoped != nil {
-		s.database.DB.Unscoped().Model(existingUnscoped).Updates(map[string]interface{}{
+		updates := map[string]interface{}{
 			"token":      req.Token,
 			"token_hash": db.HashToken(req.Token),
 			"role":       req.Role,
 			"deleted_at": nil,
 			"enabled":    true,
 			"status":     db.StatusIdle,
-		})
+		}
+		if len(req.AuthKey) > 0 {
+			updates["auth_key"] = req.AuthKey
+			updates["auth_key_id"] = req.AuthKeyID
+			updates["server_salt"] = req.ServerSalt
+		}
+		s.database.DB.Unscoped().Model(existingUnscoped).Updates(updates)
 		if req.DisplayName != "" || req.Phone != "" {
 			s.database.UpdateAccountInfo(existingUnscoped.ID, req.DisplayName, req.Phone, 0)
 		}
@@ -212,19 +238,31 @@ func (s *Server) handleSyncAccountCreated(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	acct, err := s.database.CreateAccount(req.Token, req.Role, req.BaleUserID)
+	acct, err := s.database.CreateAccountWithProvider(req.Token, req.Role, extID, provType)
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 
-	// Set display info
-	if req.DisplayName != "" || req.Phone != "" {
-		s.database.UpdateAccountInfo(acct.ID, req.DisplayName, req.Phone, 0)
+	// Set display info and Soroush keys
+	updates := map[string]interface{}{}
+	if req.DisplayName != "" {
+		updates["display_name"] = req.DisplayName
+	}
+	if req.Phone != "" {
+		updates["phone"] = req.Phone
+	}
+	if len(req.AuthKey) > 0 {
+		updates["auth_key"] = req.AuthKey
+		updates["auth_key_id"] = req.AuthKeyID
+		updates["server_salt"] = req.ServerSalt
+	}
+	if len(updates) > 0 {
+		s.database.DB.Model(acct).Updates(updates)
 	}
 
 	bumpDataVersion()
-	apiLog.Info("Sync: account created via sync — ID=%d BaleID=%d Role=%s", acct.ID, req.BaleUserID, req.Role)
+	apiLog.Info("Sync: account created via sync — ID=%d ExtID=%d Role=%s", acct.ID, extID, req.Role)
 	writeJSON(w, http.StatusCreated, acct)
 }
 
@@ -237,19 +275,30 @@ func (s *Server) handleSyncAccountDeleted(w http.ResponseWriter, r *http.Request
 	}
 
 	var req struct {
-		BaleUserID int64 `json:"bale_user_id"`
+		BaleUserID   int64  `json:"bale_user_id"`
+		ProviderType string `json:"provider_type"`
+		ExternalID   int64  `json:"external_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.BaleUserID == 0 {
-		writeError(w, http.StatusBadRequest, "bale_user_id is required")
+	provType := req.ProviderType
+	if provType == "" {
+		provType = "bale"
+	}
+	extID := req.ExternalID
+	if extID == 0 {
+		extID = req.BaleUserID
+	}
+
+	if extID == 0 {
+		writeError(w, http.StatusBadRequest, "external_id (or bale_user_id) is required")
 		return
 	}
 
-	acct, err := s.database.GetAccountByBaleUserID(req.BaleUserID)
+	acct, err := s.database.GetAccountByExternalID(provType, extID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "account not found")
 		return
@@ -269,7 +318,7 @@ func (s *Server) handleSyncAccountDeleted(w http.ResponseWriter, r *http.Request
 	}
 
 	bumpDataVersion()
-	apiLog.Info("Sync: account deleted via sync — BaleID=%d", req.BaleUserID)
+	apiLog.Info("Sync: account deleted via sync — Provider=%s ExtID=%d", provType, extID)
 	writeOK(w, "account deleted")
 }
 
@@ -282,28 +331,50 @@ func (s *Server) handleSyncPairingCreated(w http.ResponseWriter, r *http.Request
 	}
 
 	var req struct {
-		ClientBaleUserID int64 `json:"client_bale_user_id"`
-		ServerBaleUserID int64 `json:"server_bale_user_id"`
+		ClientBaleUserID   int64  `json:"client_bale_user_id"`
+		ClientProviderType string `json:"client_provider_type"`
+		ClientExternalID   int64  `json:"client_external_id"`
+		ServerBaleUserID   int64  `json:"server_bale_user_id"`
+		ServerProviderType string `json:"server_provider_type"`
+		ServerExternalID   int64  `json:"server_external_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.ClientBaleUserID == 0 || req.ServerBaleUserID == 0 {
-		writeError(w, http.StatusBadRequest, "client_bale_user_id and server_bale_user_id are required")
+	clientProv := req.ClientProviderType
+	if clientProv == "" {
+		clientProv = "bale"
+	}
+	clientExtID := req.ClientExternalID
+	if clientExtID == 0 {
+		clientExtID = req.ClientBaleUserID
+	}
+
+	serverProv := req.ServerProviderType
+	if serverProv == "" {
+		serverProv = "bale"
+	}
+	serverExtID := req.ServerExternalID
+	if serverExtID == 0 {
+		serverExtID = req.ServerBaleUserID
+	}
+
+	if clientExtID == 0 || serverExtID == 0 {
+		writeError(w, http.StatusBadRequest, "client and server external IDs are required")
 		return
 	}
 
-	clientAcct, err := s.database.GetAccountByBaleUserID(req.ClientBaleUserID)
+	clientAcct, err := s.database.GetAccountByExternalID(clientProv, clientExtID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("client account (Bale %d) not found", req.ClientBaleUserID))
+		writeError(w, http.StatusNotFound, fmt.Sprintf("client account (%s %d) not found", clientProv, clientExtID))
 		return
 	}
 
-	serverAcct, err := s.database.GetAccountByBaleUserID(req.ServerBaleUserID)
+	serverAcct, err := s.database.GetAccountByExternalID(serverProv, serverExtID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("server account (Bale %d) not found", req.ServerBaleUserID))
+		writeError(w, http.StatusNotFound, fmt.Sprintf("server account (%s %d) not found", serverProv, serverExtID))
 		return
 	}
 
@@ -327,7 +398,7 @@ func (s *Server) handleSyncPairingCreated(w http.ResponseWriter, r *http.Request
 	}
 
 	bumpDataVersion()
-	apiLog.Info("Sync: pairing created via sync — client=%d server=%d", req.ClientBaleUserID, req.ServerBaleUserID)
+	apiLog.Info("Sync: pairing created via sync — client=%s:%d server=%s:%d", clientProv, clientExtID, serverProv, serverExtID)
 	writeJSON(w, http.StatusCreated, pairing)
 }
 
@@ -340,21 +411,38 @@ func (s *Server) handleSyncPairingDeleted(w http.ResponseWriter, r *http.Request
 	}
 
 	var req struct {
-		ClientBaleUserID int64 `json:"client_bale_user_id"`
-		ServerBaleUserID int64 `json:"server_bale_user_id"`
+		ClientBaleUserID   int64  `json:"client_bale_user_id"`
+		ClientProviderType string `json:"client_provider_type"`
+		ClientExternalID   int64  `json:"client_external_id"`
+		ServerBaleUserID   int64  `json:"server_bale_user_id"`
+		ServerProviderType string `json:"server_provider_type"`
+		ServerExternalID   int64  `json:"server_external_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.ClientBaleUserID == 0 || req.ServerBaleUserID == 0 {
-		writeError(w, http.StatusBadRequest, "client_bale_user_id and server_bale_user_id are required")
-		return
+	clientProv := req.ClientProviderType
+	if clientProv == "" {
+		clientProv = "bale"
+	}
+	clientExtID := req.ClientExternalID
+	if clientExtID == 0 {
+		clientExtID = req.ClientBaleUserID
 	}
 
-	clientAcct, _ := s.database.GetAccountByBaleUserID(req.ClientBaleUserID)
-	serverAcct, _ := s.database.GetAccountByBaleUserID(req.ServerBaleUserID)
+	serverProv := req.ServerProviderType
+	if serverProv == "" {
+		serverProv = "bale"
+	}
+	serverExtID := req.ServerExternalID
+	if serverExtID == 0 {
+		serverExtID = req.ServerBaleUserID
+	}
+
+	clientAcct, _ := s.database.GetAccountByExternalID(clientProv, clientExtID)
+	serverAcct, _ := s.database.GetAccountByExternalID(serverProv, serverExtID)
 
 	if clientAcct == nil || serverAcct == nil {
 		writeOK(w, "accounts not found, pairing likely already deleted")
@@ -367,7 +455,7 @@ func (s *Server) handleSyncPairingDeleted(w http.ResponseWriter, r *http.Request
 		if p.ClientAccountID == clientAcct.ID && p.ServerAccountID == serverAcct.ID {
 			s.database.DeletePairing(p.ID)
 			bumpDataVersion()
-			apiLog.Info("Sync: pairing deleted via sync — client=%d server=%d", req.ClientBaleUserID, req.ServerBaleUserID)
+			apiLog.Info("Sync: pairing deleted via sync — client=%s:%d server=%s:%d", clientProv, clientExtID, serverProv, serverExtID)
 			writeOK(w, "pairing deleted")
 			return
 		}
@@ -376,32 +464,44 @@ func (s *Server) handleSyncPairingDeleted(w http.ResponseWriter, r *http.Request
 	writeOK(w, "pairing not found")
 }
 
-// handleCheckAccountRole checks if a bale_user_id already exists with a specific role.
-// GET /api/sync/check-role?bale_user_id=123
+// handleCheckAccountRole checks if a bale_user_id or external_id already exists with a specific role.
+// GET /api/sync/check-role?bale_user_id=123&provider_type=bale
 func (s *Server) handleCheckAccountRole(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
+	provType := r.URL.Query().Get("provider_type")
+	if provType == "" {
+		provType = "bale"
+	}
+
 	baleIDStr := r.URL.Query().Get("bale_user_id")
-	baleID, err := strconv.ParseInt(baleIDStr, 10, 64)
-	if err != nil || baleID == 0 {
-		writeError(w, http.StatusBadRequest, "valid bale_user_id is required")
+	extIDStr := r.URL.Query().Get("external_id")
+	if extIDStr == "" {
+		extIDStr = baleIDStr
+	}
+
+	extID, err := strconv.ParseInt(extIDStr, 10, 64)
+	if err != nil || extID == 0 {
+		writeError(w, http.StatusBadRequest, "valid external_id (or bale_user_id) is required")
 		return
 	}
 
-	acct, _ := s.database.GetAccountByBaleUserID(baleID)
+	acct, _ := s.database.GetAccountByExternalID(provType, extID)
 	if acct == nil {
 		// Also check soft-deleted
-		acct, _ = s.database.GetAccountByBaleUserIDUnscoped(baleID)
+		acct, _ = s.database.GetAccountByExternalIDUnscoped(provType, extID)
 	}
 
 	if acct != nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"exists":       true,
 			"role":         acct.Role,
-			"bale_user_id": acct.BaleUserID,
+			"provider":     acct.ProviderType,
+			"bale_user_id": acct.ExternalID,
+			"external_id":  acct.ExternalID,
 			"account_id":   acct.ID,
 		})
 		return
