@@ -12,13 +12,18 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// TokenPair holds one client-server Bale token pair.
+// TokenPair holds one client-server Bale/Soroush token pair.
 type TokenPair struct {
 	Index            int
+	Provider         string // "bale" or "soroush"
 	ClientToken      string
 	ServerToken      string
 	TargetUserID     int64 // The user ID that the client calls (server's user ID)
 	ExpectedCallerID int64 // The client user ID expected to call this server account
+	AuthKey          []byte
+	AuthKeyID        []byte
+	ServerSalt       []byte
+	AccessHash       int64
 }
 
 // extractUserIDFromJWT parses a Bale JWT token and extracts the user_id from payload.

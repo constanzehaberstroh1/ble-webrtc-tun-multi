@@ -21,10 +21,15 @@ func HashToken(token string) string {
 // If a soft-deleted account with the same BaleUserID exists, it is restored and updated.
 // Returns the created/restored account with its ID populated.
 func (d *Database) CreateAccount(token string, role string, baleUserID int64) (*Account, error) {
+	return d.CreateAccountWithProvider(token, role, baleUserID, "bale")
+}
+
+// CreateAccountWithProvider adds a new account for a specific provider.
+func (d *Database) CreateAccountWithProvider(token string, role string, externalID int64, providerType string) (*Account, error) {
 	tokenHash := HashToken(token)
 
 	var acct Account
-	err := d.DB.Unscoped().Where("bale_user_id = ?", baleUserID).First(&acct).Error
+	err := d.DB.Unscoped().Where("provider_type = ? AND external_id = ?", providerType, externalID).First(&acct).Error
 	if err == nil {
 		// Found existing record. If it's not soft-deleted, it's a conflict.
 		if !acct.DeletedAt.Valid {
@@ -32,14 +37,18 @@ func (d *Database) CreateAccount(token string, role string, baleUserID int64) (*
 		}
 		
 		// It is soft-deleted. Restore and update it.
-		if err := d.DB.Unscoped().Model(&acct).UpdateColumns(map[string]interface{}{
+		updates := map[string]interface{}{
 			"deleted_at": nil, // Restore
 			"token":      token,
 			"token_hash": tokenHash,
 			"role":       role,
 			"status":     StatusIdle,
 			"enabled":    true,
-		}).Error; err != nil {
+		}
+		if providerType == "bale" {
+			updates["bale_user_id"] = externalID
+		}
+		if err := d.DB.Unscoped().Model(&acct).UpdateColumns(updates).Error; err != nil {
 			return nil, fmt.Errorf("restoring soft-deleted account: %w", err)
 		}
 		
@@ -51,12 +60,16 @@ func (d *Database) CreateAccount(token string, role string, baleUserID int64) (*
 	}
 
 	acct = Account{
-		BaleUserID: baleUserID,
-		Token:      token,
-		TokenHash:  tokenHash,
-		Role:       role,
-		Status:     StatusIdle,
-		Enabled:    true,
+		ProviderType: providerType,
+		ExternalID:   externalID,
+		Token:        token,
+		TokenHash:    tokenHash,
+		Role:         role,
+		Status:       StatusIdle,
+		Enabled:      true,
+	}
+	if providerType == "bale" {
+		acct.BaleUserID = externalID
 	}
 
 	if err := d.DB.Create(&acct).Error; err != nil {
@@ -74,23 +87,34 @@ func (d *Database) GetAccount(id uint) (*Account, error) {
 	return &acct, nil
 }
 
-// GetAccountByBaleUserID retrieves an account by its Bale user ID.
-func (d *Database) GetAccountByBaleUserID(baleUserID int64) (*Account, error) {
+// GetAccountByExternalID retrieves an account by its provider type and external ID.
+func (d *Database) GetAccountByExternalID(providerType string, externalID int64) (*Account, error) {
 	var acct Account
-	if err := d.DB.Where("bale_user_id = ?", baleUserID).First(&acct).Error; err != nil {
+	if err := d.DB.Where("provider_type = ? AND external_id = ?", providerType, externalID).First(&acct).Error; err != nil {
 		return nil, err
 	}
 	return &acct, nil
 }
 
-// GetAccountByBaleUserIDUnscoped retrieves an account by its Bale user ID,
+// GetAccountByExternalIDUnscoped retrieves an account by its provider type and external ID,
 // including soft-deleted records.
-func (d *Database) GetAccountByBaleUserIDUnscoped(baleUserID int64) (*Account, error) {
+func (d *Database) GetAccountByExternalIDUnscoped(providerType string, externalID int64) (*Account, error) {
 	var acct Account
-	if err := d.DB.Unscoped().Where("bale_user_id = ?", baleUserID).First(&acct).Error; err != nil {
+	if err := d.DB.Unscoped().Where("provider_type = ? AND external_id = ?", providerType, externalID).First(&acct).Error; err != nil {
 		return nil, err
 	}
 	return &acct, nil
+}
+
+// GetAccountByBaleUserID retrieves an account by its Bale user ID.
+func (d *Database) GetAccountByBaleUserID(baleUserID int64) (*Account, error) {
+	return d.GetAccountByExternalID("bale", baleUserID)
+}
+
+// GetAccountByBaleUserIDUnscoped retrieves an account by its Bale user ID,
+// including soft-deleted records.
+func (d *Database) GetAccountByBaleUserIDUnscoped(baleUserID int64) (*Account, error) {
+	return d.GetAccountByExternalIDUnscoped("bale", baleUserID)
 }
 
 // ListAccounts returns all accounts, optionally filtered by role.
@@ -110,6 +134,17 @@ func (d *Database) ListAccounts(role string) ([]Account, error) {
 func (d *Database) ListEnabledAccounts(role string) ([]Account, error) {
 	var accounts []Account
 	if err := d.DB.Where("role = ? AND enabled = ?", role, true).
+		Order("created_at ASC").
+		Find(&accounts).Error; err != nil {
+		return nil, err
+	}
+	return accounts, nil
+}
+
+// ListEnabledAccountsByProvider returns all enabled accounts for a given role and provider type.
+func (d *Database) ListEnabledAccountsByProvider(role string, providerType string) ([]Account, error) {
+	var accounts []Account
+	if err := d.DB.Where("role = ? AND provider_type = ? AND enabled = ?", role, providerType, true).
 		Order("created_at ASC").
 		Find(&accounts).Error; err != nil {
 		return nil, err

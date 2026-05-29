@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
+	"github.com/pion/webrtc/v4"
 	"github.com/salman/ble-webrtc-tun/internal/accounts"
 	"github.com/salman/ble-webrtc-tun/internal/api"
 	"github.com/salman/ble-webrtc-tun/internal/bale"
@@ -29,17 +30,20 @@ import (
 	lk "github.com/salman/ble-webrtc-tun/internal/livekit"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
 	"github.com/salman/ble-webrtc-tun/internal/pool"
+	"github.com/salman/ble-webrtc-tun/internal/provider"
 	"github.com/salman/ble-webrtc-tun/internal/router"
+	"github.com/salman/ble-webrtc-tun/internal/soroush"
 )
 
 var mainLog = logger.New("main")
 
-// channelState holds the resources for one Bale channel.
+// channelState holds the resources for one Bale/Soroush channel.
 type channelState struct {
 	index  int
 	label  string
-	client *bale.Client
+	client provider.Client
 	sfu    *lk.SFUTransport
+	pc     *webrtc.PeerConnection
 	cfg    *config.Config
 	pair   config.TokenPair // pairing info for auto-reconnect
 }
@@ -603,18 +607,43 @@ func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
 			mainLog.Warn("[Manager] Pairing %d has missing account — skipping", p.ID)
 			continue
 		}
-		if p.ClientAccount.Token == "" {
+		clientProv := p.ClientAccount.ProviderType
+		if clientProv == "" {
+			clientProv = "bale"
+		}
+
+		if clientProv == "bale" && p.ClientAccount.Token == "" {
 			mainLog.Warn("[Manager] Client account %d has empty token — skipping", p.ClientAccount.ID)
 			continue
 		}
+		if clientProv == "soroush" && len(p.ClientAccount.AuthKey) == 0 {
+			mainLog.Warn("[Manager] Client account %d has empty auth key — skipping", p.ClientAccount.ID)
+			continue
+		}
+
+		var targetID int64
+		if clientProv == "soroush" {
+			targetID = p.ServerAccount.ExternalID
+		} else {
+			targetID = p.ServerAccount.BaleUserID
+			if targetID == 0 {
+				targetID = p.ServerAccount.ExternalID
+			}
+		}
+
 		pairs = append(pairs, config.TokenPair{
 			Index:        i + 1,
+			Provider:     clientProv,
 			ClientToken:  p.ClientAccount.Token,
-			TargetUserID: p.ServerAccount.BaleUserID,
+			TargetUserID: targetID,
+			AuthKey:      p.ClientAccount.AuthKey,
+			AuthKeyID:    p.ClientAccount.AuthKeyID,
+			ServerSalt:   p.ClientAccount.ServerSalt,
+			AccessHash:   p.ServerAccount.AccessHash,
 		})
-		mainLog.Info("[Manager] Pair %d: client=%d (Bale %d) → server=%d (Bale %d) [owner=%s]",
-			i+1, p.ClientAccountID, p.ClientAccount.BaleUserID,
-			p.ServerAccountID, p.ServerAccount.BaleUserID, tm.clientID)
+		mainLog.Info("[Manager] Pair %d: client=%d (ext=%d) → server=%d (ext=%d) [owner=%s, provider=%s]",
+			i+1, p.ClientAccountID, p.ClientAccount.ExternalID,
+			p.ServerAccountID, p.ServerAccount.ExternalID, tm.clientID, clientProv)
 	}
 
 	if len(pairs) == 0 {
@@ -943,12 +972,38 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	chanCfg.BaleAccessToken = tp.ClientToken
 	chanCfg.BaleTargetUserID = tp.TargetUserID
 
-	tm.setChannelPhase(idx, PhaseBaleConnect, "")
-	mainLog.Info("[%s] Connecting to Bale WS...", label)
-	client := bale.NewClient(tp.ClientToken)
+	providerType := tp.Provider
+	if providerType == "" {
+		providerType = "bale"
+	}
+
+	tm.setChannelPhase(idx, PhaseBaleConnect, "Connecting to "+providerType+"...")
+	mainLog.Info("[%s] Connecting to %s...", label, providerType)
+
+	factory, ok := provider.GetFactory(provider.ProviderType(providerType))
+	if !ok {
+		tm.setChannelPhase(idx, PhaseError, "No factory for provider: "+providerType)
+		return nil, nil
+	}
+
+	acctData := map[string]interface{}{
+		"token":       tp.ClientToken,
+		"external_id": tp.TargetUserID,
+		"access_hash": tp.AccessHash,
+		"auth_key":    tp.AuthKey,
+		"auth_key_id": tp.AuthKeyID,
+		"server_salt": tp.ServerSalt,
+	}
+
+	client, err := factory.NewClient(acctData)
+	if err != nil {
+		tm.setChannelPhase(idx, PhaseError, "Factory initialization failed: "+err.Error())
+		return nil, nil
+	}
+
 	if err := client.Connect(); err != nil {
-		tm.setChannelPhase(idx, PhaseError, "Bale connection failed: "+err.Error())
-		mainLog.Info("[%s] Bale connect: %v", label, err)
+		tm.setChannelPhase(idx, PhaseError, providerType+" connection failed: "+err.Error())
+		mainLog.Info("[%s] connect: %v", label, err)
 		return nil, nil
 	}
 	client.StartPingLoop()
@@ -957,194 +1012,630 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 	client.SendTextMessage(tp.TargetUserID, "BLETUN:PING")
 	time.Sleep(2 * time.Second)
 
-	tm.setChannelPhase(idx, PhaseCalling, "")
+	tm.setChannelPhase(idx, PhaseCalling, "Calling server...")
 	mainLog.Info("[%s] Calling user %d...", label, tp.TargetUserID)
-	if err := client.StartCall(tp.TargetUserID, true); err != nil {
-		tm.setChannelPhase(idx, PhaseError, "Failed to start call: "+err.Error())
-		mainLog.Info("[%s] StartCall: %v", label, err)
-		client.Close()
-		return nil, nil
-	}
 
-	tm.setChannelPhase(idx, PhaseWaitAccept, "")
-	mainLog.Info("[%s] Waiting for server to accept (60s)...", label)
-	result, err := client.WaitForAccept(60 * time.Second)
+	result, err := client.InitiateCall(ctx, tp.TargetUserID, tp.AccessHash)
 	if err != nil {
-		tm.setChannelPhase(idx, PhaseError, "Server did not accept call: "+err.Error())
-		mainLog.Info("[%s] WaitForAccept: %v", label, err)
+		tm.setChannelPhase(idx, PhaseError, "Initiate call failed: "+err.Error())
+		mainLog.Info("[%s] InitiateCall: %v", label, err)
 		client.Close()
 		return nil, nil
 	}
 
-	wssURL := result.WssURL
-	if len(wssURL) > 0 && wssURL[len(wssURL)-1] == '(' {
-		wssURL = wssURL[:len(wssURL)-1]
-	}
-	chanCfg.LiveKitToken = result.LivekitToken
-	chanCfg.LiveKitWSURL = wssURL + "/rtc"
-	mainLog.Info("[%s] ✅ Call accepted! Room: %s", label, result.RoomID)
+	if providerType == "bale" {
+		wssURL := result.WssURL
+		if len(wssURL) > 0 && wssURL[len(wssURL)-1] == '(' {
+			wssURL = wssURL[:len(wssURL)-1]
+		}
+		chanCfg.LiveKitToken = result.LivekitToken
+		chanCfg.LiveKitWSURL = wssURL + "/rtc"
+		mainLog.Info("[%s] ✅ Call accepted! Room: %s", label, result.RoomID)
 
-	tm.setChannelPhase(idx, PhaseSFUConnect, "")
-	mainLog.Info("[%s] Connecting to SFU...", label)
-	sfu := lk.NewSFUTransport(&chanCfg, tm.obfuscator)
-	if err := sfu.Connect(ctx); err != nil {
-		tm.setChannelPhase(idx, PhaseError, "SFU connection failed: "+err.Error())
-		mainLog.Info("[%s] SFU connect: %v", label, err)
-		client.Close()
-		return nil, nil
-	}
+		tm.setChannelPhase(idx, PhaseSFUConnect, "Connecting to LiveKit SFU...")
+		mainLog.Info("[%s] Connecting to SFU...", label)
+		sfu := lk.NewSFUTransport(&chanCfg, tm.obfuscator)
+		if err := sfu.Connect(ctx); err != nil {
+			tm.setChannelPhase(idx, PhaseError, "SFU connection failed: "+err.Error())
+			mainLog.Info("[%s] SFU connect: %v", label, err)
+			client.Close()
+			return nil, nil
+		}
 
-	tm.setChannelPhase(idx, PhaseWaitTrack, "")
-	mainLog.Info("[%s] Waiting for server track (30s)...", label)
-	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
-	if err := sfu.WaitForConnection(connCtx); err != nil {
+		tm.setChannelPhase(idx, PhaseWaitTrack, "Waiting for media track...")
+		mainLog.Info("[%s] Waiting for server track (30s)...", label)
+		connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := sfu.WaitForConnection(connCtx); err != nil {
+			connCancel()
+			tm.setChannelPhase(idx, PhaseError, "Timed out waiting for server media track: "+err.Error())
+			mainLog.Info("[%s] Connection timeout: %v", label, err)
+			sfu.Close()
+			client.Close()
+			return nil, nil
+		}
 		connCancel()
-		tm.setChannelPhase(idx, PhaseError, "Timed out waiting for server media track: "+err.Error())
-		mainLog.Info("[%s] Connection timeout: %v", label, err)
-		sfu.Close()
-		client.Close()
-		return nil, nil
-	}
-	connCancel()
 
-	tm.setChannelPhase(idx, PhaseTunnelSetup, "")
-	dc := sfu.DataConn()
-	if dc == nil {
-		tm.setChannelPhase(idx, PhaseError, "Data channel not ready")
-		mainLog.Info("[%s] DataConn not ready", label)
-		sfu.Close()
-		client.Close()
-		return nil, nil
-	}
+		tm.setChannelPhase(idx, PhaseTunnelSetup, "Negotiating Yamux...")
+		dc := sfu.DataConn()
+		if dc == nil {
+			tm.setChannelPhase(idx, PhaseError, "Data channel not ready")
+			mainLog.Info("[%s] DataConn not ready", label)
+			sfu.Close()
+			client.Close()
+			return nil, nil
+		}
 
-	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
-	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection (was 30s)
-	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission (was 20s)
-	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — critical for large downloads (was 1MB)
-	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections (was default 256)
-	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
+		ymuxCfg := yamux.DefaultConfig()
+		ymuxCfg.EnableKeepAlive = true
+		ymuxCfg.KeepAliveInterval = 15 * time.Second
+		ymuxCfg.ConnectionWriteTimeout = 60 * time.Second
+		ymuxCfg.StreamCloseTimeout = 120 * time.Second
+		ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024
+		ymuxCfg.AcceptBacklog = 1024
+		ymuxCfg.LogOutput = io.Discard
 
-	session, err := yamux.Client(dc, ymuxCfg)
-	if err != nil {
-		tm.setChannelPhase(idx, PhaseError, "Yamux session failed: "+err.Error())
-		mainLog.Info("[%s] Yamux: %v", label, err)
-		sfu.Close()
-		client.Close()
-		return nil, nil
-	}
+		session, err := yamux.Client(dc, ymuxCfg)
+		if err != nil {
+			tm.setChannelPhase(idx, PhaseError, "Yamux session failed: "+err.Error())
+			mainLog.Info("[%s] Yamux: %v", label, err)
+			sfu.Close()
+			client.Close()
+			return nil, nil
+		}
 
-	ch := &channelState{
-		index:  tp.Index,
-		label:  label,
-		client: client,
-		sfu:    sfu,
-		cfg:    &chanCfg,
-		pair:   tp,
+		ch := &channelState{
+			index:  tp.Index,
+			label:  label,
+			client: client,
+			sfu:    sfu,
+			cfg:    &chanCfg,
+			pair:   tp,
+		}
+		return ch, session
+
+	} else {
+		// Soroush WebRTC P2P connection logic!
+		mainLog.Info("[%s] ✅ Call accepted! Initializing Soroush P2P WebRTC connection...", label)
+		tm.setChannelPhase(idx, PhaseSFUConnect, "Connecting P2P WebRTC...")
+
+		iceServers := make([]webrtc.ICEServer, 0)
+		for _, conn := range result.Connections {
+			ice := webrtc.ICEServer{URLs: []string{conn.URL}}
+			if conn.Username != "" {
+				ice.Username = conn.Username
+				ice.Credential = conn.Password
+				ice.CredentialType = webrtc.ICECredentialTypePassword
+			}
+			iceServers = append(iceServers, ice)
+		}
+
+		config := webrtc.Configuration{
+			ICEServers:    iceServers,
+			BundlePolicy:  webrtc.BundlePolicyMaxBundle,
+			RTCPMuxPolicy: webrtc.RTCPMuxPolicyRequire,
+		}
+
+		pc, err := webrtc.NewPeerConnection(config)
+		if err != nil {
+			tm.setChannelPhase(idx, PhaseError, "Failed to create PeerConnection: "+err.Error())
+			client.Close()
+			return nil, nil
+		}
+
+		// Dummy Opus track for call camouflage
+		audioTrack, err := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+			"audio0",
+			"soroush-voice-stream",
+		)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			tm.setChannelPhase(idx, PhaseError, "Failed to create audio track: "+err.Error())
+			return nil, nil
+		}
+
+		_, err = pc.AddTrack(audioTrack)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			tm.setChannelPhase(idx, PhaseError, "Failed to add audio track: "+err.Error())
+			return nil, nil
+		}
+
+		ordered := true
+		dcInit := &webrtc.DataChannelInit{Ordered: &ordered}
+		dc, err := pc.CreateDataChannel("data", dcInit)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			tm.setChannelPhase(idx, PhaseError, "Failed to create data channel: "+err.Error())
+			return nil, nil
+		}
+
+		pendingICE := make(chan string, 64)
+		pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+			if c == nil {
+				return
+			}
+			select {
+			case pendingICE <- c.ToJSON().Candidate:
+			default:
+			}
+		})
+
+		offer, err := pc.CreateOffer(nil)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			tm.setChannelPhase(idx, PhaseError, "Failed to create offer: "+err.Error())
+			return nil, nil
+		}
+
+		if err := pc.SetLocalDescription(offer); err != nil {
+			pc.Close()
+			client.Close()
+			tm.setChannelPhase(idx, PhaseError, "Failed to set local description: "+err.Error())
+			return nil, nil
+		}
+
+		localDesc := pc.LocalDescription()
+		offerMsg := soroush.FormatSDPOffer(localDesc.SDP)
+		if err := client.SendTextMessage(tp.TargetUserID, offerMsg); err != nil {
+			pc.Close()
+			client.Close()
+			tm.setChannelPhase(idx, PhaseError, "Failed to send SDP offer: "+err.Error())
+			return nil, nil
+		}
+
+		mainLog.Info("[%s] Sent SDP offer. Waiting for remote SDP Answer...", label)
+		tm.setChannelPhase(idx, PhaseWaitTrack, "Waiting for SDP Answer...")
+
+		answerDone := make(chan bool, 1)
+		dcOpenCh := make(chan struct{})
+
+		dc.OnOpen(func() {
+			close(dcOpenCh)
+		})
+
+		sdpCtx, sdpCancel := context.WithCancel(ctx)
+		defer sdpCancel()
+
+		go func() {
+			for {
+				select {
+				case <-sdpCtx.Done():
+					return
+				case text := <-client.GetTextMsgCh():
+					if soroush.IsSDPAnswer(text) {
+						sdpStr := soroush.ExtractSDP(text)
+						mainLog.Info("[%s] Received SDP answer", label)
+
+						answer := webrtc.SessionDescription{
+							Type: webrtc.SDPTypeAnswer,
+							SDP:  sdpStr,
+						}
+						if err := pc.SetRemoteDescription(answer); err != nil {
+							mainLog.Error("[%s] SetRemoteDescription failed: %v", label, err)
+							return
+						}
+
+						go func() {
+							for {
+								select {
+								case candidate := <-pendingICE:
+									iceMsg := soroush.FormatICECandidate(candidate)
+									client.SendTextMessage(tp.TargetUserID, iceMsg)
+								case <-sdpCtx.Done():
+									return
+								}
+							}
+						}()
+						select {
+						case answerDone <- true:
+						default:
+						}
+					}
+
+					if soroush.IsICECandidate(text) {
+						candStr := soroush.ExtractICECandidate(text)
+						if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candStr}); err != nil {
+							mainLog.Warn("[%s] AddICECandidate failed: %v", label, err)
+						}
+					}
+				}
+			}
+		}()
+
+		select {
+		case <-answerDone:
+		case <-time.After(30 * time.Second):
+			pc.Close()
+			client.Close()
+			tm.setChannelPhase(idx, PhaseError, "SDP Answer timeout (30s)")
+			return nil, nil
+		case <-ctx.Done():
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+
+		mainLog.Info("[%s] SDP Answer accepted. Waiting for Data Channel open...", label)
+		tm.setChannelPhase(idx, PhaseTunnelSetup, "Establishing Data Channel...")
+
+		select {
+		case <-dcOpenCh:
+		case <-time.After(15 * time.Second):
+			pc.Close()
+			client.Close()
+			tm.setChannelPhase(idx, PhaseError, "Data Channel open timeout (15s)")
+			return nil, nil
+		case <-ctx.Done():
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+
+		mainLog.Info("[%s] ✅ Data Channel OPEN! Starting Yamux multiplexer...", label)
+
+		dcConn := soroush.NewDataChannelConn(dc)
+		ymuxCfg := yamux.DefaultConfig()
+		ymuxCfg.EnableKeepAlive = true
+		ymuxCfg.KeepAliveInterval = 15 * time.Second
+		ymuxCfg.ConnectionWriteTimeout = 60 * time.Second
+		ymuxCfg.StreamCloseTimeout = 120 * time.Second
+		ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024
+		ymuxCfg.AcceptBacklog = 1024
+		ymuxCfg.LogOutput = io.Discard
+
+		session, err := yamux.Client(dcConn, ymuxCfg)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			tm.setChannelPhase(idx, PhaseError, "Yamux session init failed: "+err.Error())
+			return nil, nil
+		}
+
+		ch := &channelState{
+			index:  tp.Index,
+			label:  label,
+			client: client,
+			pc:     pc,
+			cfg:    &chanCfg,
+			pair:   tp,
+		}
+		return ch, session
 	}
-	return ch, session
 }
 
-// initChannel establishes one Bale call → SFU → yamux channel.
+// initChannel establishes one Bale/Soroush call → SFU/P2P → yamux channel.
 func initChannel(ctx context.Context, baseCfg *config.Config, tp config.TokenPair, label string, obfuscator *dcconn.Obfuscator) (*channelState, *yamux.Session) {
 	// Create a copy of config for this channel
 	chanCfg := *baseCfg
 	chanCfg.BaleAccessToken = tp.ClientToken
 	chanCfg.BaleTargetUserID = tp.TargetUserID
 
-	mainLog.Info("[%s] Connecting to Bale WS...", label)
-	client := bale.NewClient(tp.ClientToken)
+	providerType := tp.Provider
+	if providerType == "" {
+		providerType = "bale"
+	}
+
+	mainLog.Info("[%s] Connecting to %s...", label, providerType)
+	factory, ok := provider.GetFactory(provider.ProviderType(providerType))
+	if !ok {
+		mainLog.Error("[%s] No factory for provider: %s", label, providerType)
+		return nil, nil
+	}
+
+	acctData := map[string]interface{}{
+		"token":       tp.ClientToken,
+		"external_id": tp.TargetUserID,
+		"access_hash": tp.AccessHash,
+		"auth_key":    tp.AuthKey,
+		"auth_key_id": tp.AuthKeyID,
+		"server_salt": tp.ServerSalt,
+	}
+
+	client, err := factory.NewClient(acctData)
+	if err != nil {
+		mainLog.Error("[%s] Factory initialization failed: %v", label, err)
+		return nil, nil
+	}
+
 	if err := client.Connect(); err != nil {
-		mainLog.Info("[%s] Bale connect: %v", label, err)
+		mainLog.Info("[%s] %s connect failed: %v", label, providerType, err)
 		return nil, nil
 	}
 	client.StartPingLoop()
 
-	// Warm up: send a greeting message to establish contact
-	// Bale requires prior chat history before allowing calls between strangers
 	mainLog.Info("[%s] Sending warmup message to %d...", label, tp.TargetUserID)
 	client.SendTextMessage(tp.TargetUserID, "BLETUN:PING")
 	time.Sleep(2 * time.Second)
 
 	mainLog.Info("[%s] Calling user %d...", label, tp.TargetUserID)
-	if err := client.StartCall(tp.TargetUserID, true); err != nil {
-		mainLog.Info("[%s] StartCall: %v", label, err)
-		client.Close()
-		return nil, nil
-	}
-
-	mainLog.Info("[%s] Waiting for server to accept (60s)...", label)
-	result, err := client.WaitForAccept(60 * time.Second)
+	result, err := client.InitiateCall(ctx, tp.TargetUserID, tp.AccessHash)
 	if err != nil {
-		mainLog.Info("[%s] WaitForAccept: %v", label, err)
+		mainLog.Info("[%s] InitiateCall failed: %v", label, err)
 		client.Close()
 		return nil, nil
 	}
 
-	wssURL := result.WssURL
-	if len(wssURL) > 0 && wssURL[len(wssURL)-1] == '(' {
-		wssURL = wssURL[:len(wssURL)-1]
-	}
-	chanCfg.LiveKitToken = result.LivekitToken
-	chanCfg.LiveKitWSURL = wssURL + "/rtc"
-	mainLog.Info("[%s] ✅ Call accepted! Room: %s", label, result.RoomID)
+	if providerType == "bale" {
+		wssURL := result.WssURL
+		if len(wssURL) > 0 && wssURL[len(wssURL)-1] == '(' {
+			wssURL = wssURL[:len(wssURL)-1]
+		}
+		chanCfg.LiveKitToken = result.LivekitToken
+		chanCfg.LiveKitWSURL = wssURL + "/rtc"
+		mainLog.Info("[%s] ✅ Call accepted! Room: %s", label, result.RoomID)
 
-	// Connect to LiveKit SFU
-	mainLog.Info("[%s] Connecting to SFU...", label)
-	sfu := lk.NewSFUTransport(&chanCfg, obfuscator) // Legacy initChannel — obfuscator for anti-DPI
-	if err := sfu.Connect(ctx); err != nil {
-		mainLog.Info("[%s] SFU connect: %v", label, err)
-		client.Close()
-		return nil, nil
-	}
+		// Connect to LiveKit SFU
+		mainLog.Info("[%s] Connecting to SFU...", label)
+		sfu := lk.NewSFUTransport(&chanCfg, obfuscator)
+		if err := sfu.Connect(ctx); err != nil {
+			mainLog.Info("[%s] SFU connect: %v", label, err)
+			client.Close()
+			return nil, nil
+		}
 
-	// Wait for remote track
-	mainLog.Info("[%s] Waiting for server track (30s)...", label)
-	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
-	if err := sfu.WaitForConnection(connCtx); err != nil {
+		// Wait for remote track
+		mainLog.Info("[%s] Waiting for server track (30s)...", label)
+		connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := sfu.WaitForConnection(connCtx); err != nil {
+			connCancel()
+			mainLog.Info("[%s] Connection timeout: %v", label, err)
+			sfu.Close()
+			client.Close()
+			return nil, nil
+		}
 		connCancel()
-		mainLog.Info("[%s] Connection timeout: %v", label, err)
-		sfu.Close()
-		client.Close()
-		return nil, nil
-	}
-	connCancel()
 
-	// Setup yamux
-	dc := sfu.DataConn()
-	if dc == nil {
-		mainLog.Info("[%s] DataConn not ready", label)
-		sfu.Close()
-		client.Close()
-		return nil, nil
-	}
+		// Setup yamux
+		dc := sfu.DataConn()
+		if dc == nil {
+			mainLog.Info("[%s] DataConn not ready", label)
+			sfu.Close()
+			client.Close()
+			return nil, nil
+		}
 
-	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
-	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection
-	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission
-	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — critical for large downloads
-	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections
-	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
+		ymuxCfg := yamux.DefaultConfig()
+		ymuxCfg.EnableKeepAlive = true
+		ymuxCfg.KeepAliveInterval = 15 * time.Second
+		ymuxCfg.ConnectionWriteTimeout = 60 * time.Second
+		ymuxCfg.StreamCloseTimeout = 120 * time.Second
+		ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024
+		ymuxCfg.AcceptBacklog = 1024
+		ymuxCfg.LogOutput = io.Discard
 
-	session, err := yamux.Client(dc, ymuxCfg)
-	if err != nil {
-		mainLog.Info("[%s] Yamux: %v", label, err)
-		sfu.Close()
-		client.Close()
-		return nil, nil
-	}
+		session, err := yamux.Client(dc, ymuxCfg)
+		if err != nil {
+			mainLog.Info("[%s] Yamux: %v", label, err)
+			sfu.Close()
+			client.Close()
+			return nil, nil
+		}
 
-	ch := &channelState{
-		index:  tp.Index,
-		label:  label,
-		client: client,
-		sfu:    sfu,
-		cfg:    &chanCfg,
+		ch := &channelState{
+			index:  tp.Index,
+			label:  label,
+			client: client,
+			sfu:    sfu,
+			cfg:    &chanCfg,
+			pair:   tp,
+		}
+		return ch, session
+
+	} else {
+		// Soroush WebRTC P2P connection logic!
+		mainLog.Info("[%s] ✅ Call accepted! Initializing Soroush P2P WebRTC connection...", label)
+
+		iceServers := make([]webrtc.ICEServer, 0)
+		for _, conn := range result.Connections {
+			ice := webrtc.ICEServer{URLs: []string{conn.URL}}
+			if conn.Username != "" {
+				ice.Username = conn.Username
+				ice.Credential = conn.Password
+				ice.CredentialType = webrtc.ICECredentialTypePassword
+			}
+			iceServers = append(iceServers, ice)
+		}
+
+		config := webrtc.Configuration{
+			ICEServers:    iceServers,
+			BundlePolicy:  webrtc.BundlePolicyMaxBundle,
+			RTCPMuxPolicy: webrtc.RTCPMuxPolicyRequire,
+		}
+
+		pc, err := webrtc.NewPeerConnection(config)
+		if err != nil {
+			mainLog.Error("[%s] Failed to create PeerConnection: %v", label, err)
+			client.Close()
+			return nil, nil
+		}
+
+		// Dummy Opus track for call camouflage
+		audioTrack, err := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+			"audio0",
+			"soroush-voice-stream",
+		)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			mainLog.Error("[%s] Failed to create audio track: %v", label, err)
+			return nil, nil
+		}
+
+		_, err = pc.AddTrack(audioTrack)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			mainLog.Error("[%s] Failed to add audio track: %v", label, err)
+			return nil, nil
+		}
+
+		ordered := true
+		dcInit := &webrtc.DataChannelInit{Ordered: &ordered}
+		dc, err := pc.CreateDataChannel("data", dcInit)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			mainLog.Error("[%s] Failed to create data channel: %v", label, err)
+			return nil, nil
+		}
+
+		pendingICE := make(chan string, 64)
+		pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+			if c == nil {
+				return
+			}
+			select {
+			case pendingICE <- c.ToJSON().Candidate:
+			default:
+			}
+		})
+
+		offer, err := pc.CreateOffer(nil)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			mainLog.Error("[%s] Failed to create offer: %v", label, err)
+			return nil, nil
+		}
+
+		if err := pc.SetLocalDescription(offer); err != nil {
+			pc.Close()
+			client.Close()
+			mainLog.Error("[%s] Failed to set local description: %v", label, err)
+			return nil, nil
+		}
+
+		localDesc := pc.LocalDescription()
+		offerMsg := soroush.FormatSDPOffer(localDesc.SDP)
+		if err := client.SendTextMessage(tp.TargetUserID, offerMsg); err != nil {
+			pc.Close()
+			client.Close()
+			mainLog.Error("[%s] Failed to send SDP offer: %v", label, err)
+			return nil, nil
+		}
+
+		mainLog.Info("[%s] Sent SDP offer. Waiting for remote SDP Answer...", label)
+
+		answerDone := make(chan bool, 1)
+		dcOpenCh := make(chan struct{})
+
+		dc.OnOpen(func() {
+			close(dcOpenCh)
+		})
+
+		sdpCtx, sdpCancel := context.WithCancel(ctx)
+		defer sdpCancel()
+
+		go func() {
+			for {
+				select {
+				case <-sdpCtx.Done():
+					return
+				case text := <-client.GetTextMsgCh():
+					if soroush.IsSDPAnswer(text) {
+						sdpStr := soroush.ExtractSDP(text)
+						mainLog.Info("[%s] Received SDP answer", label)
+
+						answer := webrtc.SessionDescription{
+							Type: webrtc.SDPTypeAnswer,
+							SDP:  sdpStr,
+						}
+						if err := pc.SetRemoteDescription(answer); err != nil {
+							mainLog.Error("[%s] SetRemoteDescription failed: %v", label, err)
+							return
+						}
+
+						go func() {
+							for {
+								select {
+								case candidate := <-pendingICE:
+									iceMsg := soroush.FormatICECandidate(candidate)
+									client.SendTextMessage(tp.TargetUserID, iceMsg)
+								case <-sdpCtx.Done():
+									return
+								}
+							}
+						}()
+						select {
+						case answerDone <- true:
+						default:
+						}
+					}
+
+					if soroush.IsICECandidate(text) {
+						candStr := soroush.ExtractICECandidate(text)
+						if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candStr}); err != nil {
+							mainLog.Warn("[%s] AddICECandidate failed: %v", label, err)
+						}
+					}
+				}
+			}
+		}()
+
+		select {
+		case <-answerDone:
+		case <-time.After(30 * time.Second):
+			pc.Close()
+			client.Close()
+			mainLog.Error("[%s] SDP Answer timeout (30s)", label)
+			return nil, nil
+		case <-ctx.Done():
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+
+		mainLog.Info("[%s] SDP Answer accepted. Waiting for Data Channel open...", label)
+
+		select {
+		case <-dcOpenCh:
+		case <-time.After(15 * time.Second):
+			pc.Close()
+			client.Close()
+			mainLog.Error("[%s] Data Channel open timeout (15s)", label)
+			return nil, nil
+		case <-ctx.Done():
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+
+		mainLog.Info("[%s] ✅ Data Channel OPEN! Starting Yamux multiplexer...", label)
+
+		dcConn := soroush.NewDataChannelConn(dc)
+		ymuxCfg := yamux.DefaultConfig()
+		ymuxCfg.EnableKeepAlive = true
+		ymuxCfg.KeepAliveInterval = 15 * time.Second
+		ymuxCfg.ConnectionWriteTimeout = 60 * time.Second
+		ymuxCfg.StreamCloseTimeout = 120 * time.Second
+		ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024
+		ymuxCfg.AcceptBacklog = 1024
+		ymuxCfg.LogOutput = io.Discard
+
+		session, err := yamux.Client(dcConn, ymuxCfg)
+		if err != nil {
+			pc.Close()
+			client.Close()
+			mainLog.Error("[%s] Yamux session init failed: %v", label, err)
+			return nil, nil
+		}
+
+		ch := &channelState{
+			index:  tp.Index,
+			label:  label,
+			client: client,
+			pc:     pc,
+			cfg:    &chanCfg,
+			pair:   tp,
+		}
+		return ch, session
 	}
-	return ch, session
 }
 
 // getLocalIPs returns all non-loopback IPv4 addresses from local network
@@ -1426,7 +1917,7 @@ func dialAndRelay(p *pool.TunnelPool, addr string, localConn net.Conn) {
 	<-done
 }
 
-// runDisconnect connects to each Bale account, ends active calls,
+// runDisconnect connects to each Bale/Soroush account, ends active calls,
 // deletes all messages from all chats, and exits cleanly.
 func runDisconnect(database *db.Database) {
 	mainLog.Info("[Disconnect] 🧹 Cleaning up all accounts...")
@@ -1438,10 +1929,27 @@ func runDisconnect(database *db.Database) {
 		if p.ClientAccount == nil || p.ServerAccount == nil {
 			continue
 		}
+		clientProv := p.ClientAccount.ProviderType
+		if clientProv == "" {
+			clientProv = "bale"
+		}
+		var targetID int64
+		if clientProv == "soroush" {
+			targetID = p.ServerAccount.ExternalID
+		} else {
+			targetID = p.ServerAccount.BaleUserID
+			if targetID == 0 {
+				targetID = p.ServerAccount.ExternalID
+			}
+		}
 		pairs = append(pairs, config.TokenPair{
 			Index:        i + 1,
+			Provider:     clientProv,
 			ClientToken:  p.ClientAccount.Token,
-			TargetUserID: p.ServerAccount.BaleUserID,
+			TargetUserID: targetID,
+			AuthKey:      p.ClientAccount.AuthKey,
+			AuthKeyID:    p.ClientAccount.AuthKeyID,
+			ServerSalt:   p.ClientAccount.ServerSalt,
 		})
 	}
 	if len(pairs) == 0 {
@@ -1465,9 +1973,28 @@ func runDisconnect(database *db.Database) {
 		go func(tp config.TokenPair) {
 			defer wg.Done()
 			label := fmt.Sprintf("ch%d", tp.Index)
-
-			mainLog.Info("[%s] Connecting to Bale...", label)
-			client := bale.NewClient(tp.ClientToken)
+			prov := tp.Provider
+			if prov == "" {
+				prov = "bale"
+			}
+			mainLog.Info("[%s] Connecting to %s...", label, prov)
+			factory, ok := provider.GetFactory(provider.ProviderType(prov))
+			if !ok {
+				mainLog.Error("[%s] ❌ Factory not found for %s", label, prov)
+				return
+			}
+			acctData := map[string]interface{}{
+				"token":       tp.ClientToken,
+				"external_id": tp.TargetUserID,
+				"auth_key":    tp.AuthKey,
+				"auth_key_id": tp.AuthKeyID,
+				"server_salt": tp.ServerSalt,
+			}
+			client, err := factory.NewClient(acctData)
+			if err != nil {
+				mainLog.Error("[%s] ❌ NewClient failed: %v", label, err)
+				return
+			}
 			if err := client.Connect(); err != nil {
 				mainLog.Error("[%s] ❌ Connect failed: %v", label, err)
 				return

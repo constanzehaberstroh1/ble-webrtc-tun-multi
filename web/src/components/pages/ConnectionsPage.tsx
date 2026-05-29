@@ -182,7 +182,7 @@ export function ConnectionsPage() {
   ];
 
   const accountTrafficCols = [
-    { title: 'Account', key: 'account', render: (_: any, r: any) => <Space><Tag color={r.role === 'SERVER' ? 'blue' : 'purple'}>{r.role}</Tag><Text strong>#{r.id}</Text><Text type="secondary">{r.display_name || r.bale_user_id}</Text></Space> },
+    { title: 'Account', key: 'account', render: (_: any, r: any) => <Space><Tag color={r.role === 'SERVER' ? 'blue' : 'purple'}>{r.role}</Tag>{r.provider_type && <Tag color={r.provider_type === 'soroush' ? 'orange' : 'green'} style={{ fontSize: 10, fontWeight: 'bold' }}>{r.provider_type.toUpperCase()}</Tag>}<Text strong>#{r.id}</Text><Text type="secondary">{r.display_name || r.external_id || r.bale_user_id}</Text></Space> },
     { title: 'Sessions', dataIndex: 'sessionCount', key: 'sessions' },
     { title: 'Sent', key: 'sent', render: (_: any, r: any) => <Text type="success" className="font-mono">{fmt(r.totalSent)}</Text> },
     { title: 'Received', key: 'recv', render: (_: any, r: any) => <Text className="font-mono" style={{ color: '#06b6d4' }}>{fmt(r.totalReceived)}</Text> },
@@ -230,7 +230,7 @@ export function ConnectionsPage() {
           >
             {accounts.map((a: any) => (
               <Select.Option key={a.id} value={a.id}>
-                #{a.id} — {a.display_name || a.bale_user_id} ({a.role})
+                #{a.id} — [{(a.provider_type || 'bale').toUpperCase()}] {a.display_name || a.external_id || a.bale_user_id} ({a.role})
               </Select.Option>
             ))}
           </Select>

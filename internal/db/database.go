@@ -96,6 +96,10 @@ func open(role string) (*Database, error) {
 		return nil, fmt.Errorf("auto-migrate: %w", err)
 	}
 
+	// Backfill existing accounts to support multi-provider transition
+	db.Exec(`UPDATE accounts SET provider_type = 'bale' WHERE provider_type = '' OR provider_type IS NULL`)
+	db.Exec(`UPDATE accounts SET external_id = bale_user_id WHERE (external_id = 0 OR external_id IS NULL) AND bale_user_id != 0`)
+
 	dbLog.Info("✅ Database ready (role=%s)", role)
 
 	return &Database{

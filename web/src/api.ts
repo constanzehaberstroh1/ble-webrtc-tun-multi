@@ -96,9 +96,9 @@ export const api = {
   syncStatus: () => request('/sync/status'),
   syncSnapshot: () => request('/sync/snapshot'),
 
-  // Bale OTP Login — role is auto-determined
-  baleLoginStart: (phone: string) => request('/bale/login/start', { method: 'POST', body: JSON.stringify({ phone }) }),
-  baleLoginVerify: (phone: string, code: string) => request('/bale/login/verify', { method: 'POST', body: JSON.stringify({ phone, code }) }),
+  // Bale/Soroush OTP Login — role is auto-determined
+  baleLoginStart: (phone: string, provider?: string) => request('/bale/login/start', { method: 'POST', body: JSON.stringify({ phone, provider: provider || 'bale' }) }),
+  baleLoginVerify: (phone: string, code: string, provider?: string) => request('/bale/login/verify', { method: 'POST', body: JSON.stringify({ phone, code, provider: provider || 'bale' }) }),
 
   // Tunnel Controls
   tunnelStart: () => request('/tunnel/start', { method: 'POST' }),
