@@ -8,24 +8,29 @@ import (
 	"gorm.io/gorm"
 )
 
-// Account represents a Bale token and its current routing state.
+// Account represents a Bale or Soroush token/account and its current routing state.
 // Each account is either a CLIENT (initiates calls) or SERVER (accepts calls).
 type Account struct {
-	ID          uint           `gorm:"primarykey" json:"id"`
-	BaleUserID  int64          `gorm:"uniqueIndex;not null" json:"bale_user_id"`
-	AccessHash  int64          `json:"access_hash"`
-	Token       string         `gorm:"not null" json:"-"` // never expose token in JSON
-	TokenHash   string         `gorm:"index" json:"-"`    // SHA256 prefix for display
-	Role        string         `gorm:"type:text;not null;index" json:"role"` // CLIENT or SERVER
-	Status      string         `gorm:"type:text;default:'IDLE';index" json:"status"` // IDLE, RESERVED, IN_CALL, OFFLINE, ERROR
-	DisplayName string         `json:"display_name"`
-	Phone       string         `json:"phone"`
-	Enabled     bool           `gorm:"default:true" json:"enabled"`
-	LastSeen    *time.Time     `json:"last_seen"`
-	LastError   string         `json:"last_error,omitempty"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
-	DeletedAt   gorm.DeletedAt `gorm:"index" json:"-"`
+	ID           uint           `gorm:"primarykey" json:"id"`
+	ProviderType string         `gorm:"type:text;not null;default:'bale';index:idx_provider_ext,unique" json:"provider_type"` // bale, soroush
+	ExternalID   int64          `gorm:"not null;index:idx_provider_ext,unique" json:"external_id"`
+	BaleUserID   int64          `gorm:"index" json:"bale_user_id"` // Deprecated in favor of ExternalID
+	AccessHash   int64          `json:"access_hash"`
+	Token        string         `gorm:"default:''" json:"-"` // never expose token in JSON (only for Bale)
+	TokenHash    string         `gorm:"index" json:"-"`      // SHA256 prefix for display
+	AuthKey      []byte         `gorm:"type:blob" json:"-"`  // Soroush auth_key
+	AuthKeyID    []byte         `gorm:"type:blob" json:"-"`  // Soroush auth_key_id
+	ServerSalt   []byte         `gorm:"type:blob" json:"-"`  // Soroush server_salt
+	Role         string         `gorm:"type:text;not null;index" json:"role"` // CLIENT or SERVER
+	Status       string         `gorm:"type:text;default:'IDLE';index" json:"status"` // IDLE, RESERVED, IN_CALL, OFFLINE, ERROR
+	DisplayName  string         `json:"display_name"`
+	Phone        string         `json:"phone"`
+	Enabled      bool           `gorm:"default:true" json:"enabled"`
+	LastSeen     *time.Time     `json:"last_seen"`
+	LastError    string         `json:"last_error,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
+	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
 // Pairing links one client account to one server account for call routing.

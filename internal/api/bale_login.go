@@ -157,7 +157,7 @@ func (s *Server) handleBaleLoginVerify(w http.ResponseWriter, r *http.Request) {
 
 	// Check remote server for cross-role conflict
 	if s.RemoteServerURL != "" {
-		if err := s.checkRemoteRoleConflict(result.UserID, req.Role); err != nil {
+		if err := s.checkRemoteRoleConflict("bale", result.UserID, req.Role); err != nil {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
