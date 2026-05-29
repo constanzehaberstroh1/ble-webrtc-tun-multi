@@ -7,6 +7,14 @@
       "git_ssh_url": "git+ssh://git@push-n2-mtl-clevercloud-customers.services.clever-cloud.com/app_8a8f8bce-3219-4fbb-ac19-a6b6783eff5b.git",
       "name": "ble-webrtc-tun",
       "alias": "ble-webrtc-tun"
+    },
+    {
+      "app_id": "app_1940b1ac-3072-43ff-a004-68e1a738e316",
+      "org_id": "user_2a227aa8-bb2d-4d4e-8dd9-763baccf97e7",
+      "deploy_url": "https://push-n3-par-clevercloud-customers.services.clever-cloud.com/app_1940b1ac-3072-43ff-a004-68e1a738e316.git",
+      "git_ssh_url": "git+ssh://git@push-n3-par-clevercloud-customers.services.clever-cloud.com/app_1940b1ac-3072-43ff-a004-68e1a738e316.git",
+      "name": "multi data pipeline",
+      "alias": "multi-data-pipeline"
     }
   ]
 }
