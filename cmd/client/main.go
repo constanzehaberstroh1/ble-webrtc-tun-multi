@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -33,6 +32,7 @@ import (
 	"github.com/salman/ble-webrtc-tun/internal/provider"
 	"github.com/salman/ble-webrtc-tun/internal/quicconn"
 	"github.com/salman/ble-webrtc-tun/internal/router"
+	"github.com/salman/ble-webrtc-tun/internal/soroush"
 )
 
 var mainLog = logger.New("main")
@@ -44,6 +44,7 @@ type channelState struct {
 	client provider.Client
 	sfu    *lk.SFUTransport
 	pc     *webrtc.PeerConnection
+	qconn  quic.Connection // QUIC connection for this channel
 	cfg    *config.Config
 	pair   config.TokenPair // pairing info for auto-reconnect
 }
@@ -714,10 +715,14 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 	var mu sync.Mutex
 	var proxyOnce sync.Once
 
-	// === SEQUENTIAL CONNECTION ===
-	// Connect pairs ONE AT A TIME to avoid overwhelming Bale's SFU.
-	// Each pair waits for the previous to fully connect or fail before starting.
-	// This respects Bale's rate limiting and prevents signaling races.
+	// === PARALLEL CONNECTION ===
+	// Dial all channels concurrently so the pool is fully populated before
+	// heavy traffic starts. Sequential dialing let ch1 absorb 100% of traffic
+	// while ch2..chN were still handshaking — now all connect in parallel.
+	//
+	// A 2s × index stagger avoids hammering the SFU simultaneously, but total
+	// startup time is now ~1 channel RTT + stagger instead of N × RTT.
+	var wg sync.WaitGroup
 	for i, pair := range pairs {
 		select {
 		case <-ctx.Done():
@@ -725,57 +730,57 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 		default:
 		}
 
-		label := fmt.Sprintf("ch%d", pair.Index)
+		wg.Add(1)
+		go func(i int, pair config.TokenPair) {
+			defer wg.Done()
 
-		// Small stagger between pairs (2-4s) — enough for Bale to process
-		// without triggering anti-spam, but much faster than the old 8-10s.
-		if i > 0 {
-			tm.setChannelPhase(i, PhaseInit, "")
-			delay := time.Duration(2000+rand.Intn(2000)) * time.Millisecond
-			mainLog.Info("[%s] Waiting %.1fs before connecting (sequential)...", label, delay.Seconds())
-			select {
-			case <-ctx.Done():
+			label := fmt.Sprintf("ch%d", pair.Index)
+
+			// Stagger: 2s × index (ch1=0s, ch2=2s, ch3=4s, ch4=6s…)
+			if i > 0 {
+				tm.setChannelPhase(i, PhaseInit, "")
+				stagger := time.Duration(i) * 2 * time.Second
+				mainLog.Info("[%s] 🕐 Stagger %.0fs (parallel dial)...", label, stagger.Seconds())
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(stagger):
+				}
+			}
+
+			tm.setChannelPhase(i, PhaseBaleConnect, "")
+			mainLog.Info("[%s] 🔗 Connecting pair %d/%d (parallel)...", label, i+1, len(pairs))
+
+			ch, qconn := tm.initChannelTracked(ctx, i, pair, label)
+			if ch == nil || qconn == nil {
+				mainLog.Warn("[%s] ❌ Channel init failed", label)
+				tm.setChannelPhase(i, PhaseError, "init failed")
 				return
-			case <-time.After(delay):
 			}
-		}
 
-		// Track phases through initChannel
-		tm.setChannelPhase(i, PhaseBaleConnect, "")
-		mainLog.Info("[%s] 🔗 Connecting pair %d/%d (sequential)...", label, i+1, len(pairs))
+			tm.setChannelPhase(i, PhaseTunnelActive, "")
+			tunnelPool.Add(qconn, label)
+			mu.Lock()
+			channels = append(channels, ch)
+			mu.Unlock()
+			mainLog.Info("[%s] ✅ Channel ready! (%d/%d connected)", label, tunnelPool.ActiveCount(), len(pairs))
 
-		ch, qconn := tm.initChannelTracked(ctx, i, pair, label)
-		if ch == nil || qconn == nil {
-			mainLog.Warn("[%s] ❌ Channel init failed — continuing to next pair", label)
-			// Brief cooldown after failure before trying next pair
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(3 * time.Second):
-			}
-			continue
-		}
+			// Start proxies as soon as first channel is ready
+			proxyOnce.Do(func() {
+				go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
+				go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
+				mainLog.Info(" ✅ Proxies started on ALL interfaces (first channel ready)!")
+				for _, ip := range getLocalIPs() {
+					mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
+				}
+			})
 
-		tm.setChannelPhase(i, PhaseTunnelActive, "")
-		tunnelPool.Add(qconn, label)
-		mu.Lock()
-		channels = append(channels, ch)
-		mu.Unlock()
-		mainLog.Info("[%s] ✅ Channel ready! (%d/%d connected)", label, tunnelPool.ActiveCount(), len(pairs))
-
-		// Start proxies on all interfaces as soon as first channel connects
-		proxyOnce.Do(func() {
-			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
-			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
-			mainLog.Info(" ✅ Proxies started on ALL interfaces (first channel ready)!")
-			for _, ip := range getLocalIPs() {
-				mainLog.Info("  SOCKS5: %s:10909  |  HTTP: %s:9095", ip, ip)
-			}
-		})
-
-		// Monitor this channel for death and auto-reconnect
-		go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
+			go tm.monitorAndReconnect(ctx, tunnelPool, ch, qconn, i, pair, label, &mu, &channels, &proxyOnce)
+		}(i, pair)
 	}
+
+	// Wait for all parallel dials to complete before checking results
+	wg.Wait()
 
 	if ctx.Err() != nil {
 		return
@@ -849,9 +854,11 @@ func (tm *TunnelManager) runTunnels(ctx context.Context, tunnelPool *pool.Tunnel
 
 
 // monitorAndReconnect watches a QUIC connection and auto-reconnects on failure.
-// It detects death instantly via qconn.Context().Done() (QUIC internal error)
-// AND via SFU ICE/health checks every 5s for faster WebRTC layer detection.
-// Uses exponential backoff (3s → 6s → 12s … cap 30s).
+//
+// Three detection paths (all trigger immediate reconnect):
+//  1. QUIC context cancelled (connection closed by QUIC layer or circuit breaker)
+//  2. WebRTC ICE layer disconnected/failed (binds WebRTC to QUIC lifecycle)
+//  3. SFU WebSocket unhealthy (no pong for 60s)
 func (tm *TunnelManager) monitorAndReconnect(
 	ctx context.Context,
 	tunnelPool *pool.TunnelPool,
@@ -871,62 +878,55 @@ func (tm *TunnelManager) monitorAndReconnect(
 	currentCh := ch
 
 	for {
-		// Wait for QUIC connection death OR SFU health degradation.
-		// Whichever fires first triggers reconnect.
-		deadDetected := false
-		ticker := time.NewTicker(5 * time.Second)
-	monitorLoop:
-		for {
+		// ── Liveness check every 3s ───────────────────────────────────────
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
+
+		dead := false
+
+		// Check 1: QUIC connection context (catches circuit-breaker kills too)
+		if currentQConn != nil {
 			select {
-			case <-ctx.Done():
-				ticker.Stop()
-				return
 			case <-currentQConn.Context().Done():
-				// QUIC connection internally closed (stream exhaustion, idle timeout, etc.)
-				mainLog.Warn("[%s] 💀 QUIC connection died (internal error)", label)
-				deadDetected = true
-				break monitorLoop
-			case <-ticker.C:
-				// Proactive SFU health check: if ICE/WebRTC layer is dead,
-				// kill the QUIC conn now instead of waiting 30s for idle timeout.
-				if currentCh != nil && currentCh.sfu != nil {
-					health := currentCh.sfu.GetHealth()
-					if health.PubICEState == "disconnected" || health.PubICEState == "failed" ||
-						health.SubICEState == "disconnected" || health.SubICEState == "failed" {
-						mainLog.Warn("[%s] 💀 WebRTC ICE dead (pub=%s sub=%s) — force-killing QUIC",
-							label, health.PubICEState, health.SubICEState)
-						currentQConn.CloseWithError(1, "ice layer dead")
-						deadDetected = true
-						break monitorLoop
-					}
-					if !health.SFUHealthy {
-						mainLog.Warn("[%s] 💀 SFU WS unhealthy (no pong) — force-killing QUIC", label)
-						currentQConn.CloseWithError(1, "sfu ws dead")
-						deadDetected = true
-						break monitorLoop
-					}
-				}
+				mainLog.Warn("[%s] 💀 QUIC connection dead (context cancelled)", label)
+				dead = true
+			default:
 			}
 		}
-		ticker.Stop()
 
-		if !deadDetected {
-			return
+		// Check 2: WebRTC ICE state — kill QUIC immediately rather than
+		// waiting for QUIC's 30-60s idle timeout.
+		if !dead && currentCh != nil && currentCh.sfu != nil {
+			health := currentCh.sfu.GetHealth()
+			if health.PubICEState == "disconnected" || health.PubICEState == "failed" ||
+				health.SubICEState == "disconnected" || health.SubICEState == "failed" {
+				mainLog.Warn("[%s] ⚠️ WebRTC ICE is %s/%s — force-killing QUIC",
+					label, health.PubICEState, health.SubICEState)
+				dead = true
+			}
+			if !dead && !health.SFUHealthy {
+				mainLog.Warn("[%s] ⚠️ SFU WS unhealthy — force-killing QUIC", label)
+				dead = true
+			}
 		}
 
-		// Connection is dead — clean up
-		mainLog.Warn("[%s] 💀 Channel dead — starting auto-reconnect (backoff: %.0fs)", label, backoff.Seconds())
-		tm.setChannelPhase(idx, PhaseDisconnected, "connection died, reconnecting...")
+		if !dead {
+			continue // still alive
+		}
 
-		// Remove dead QUIC conn from pool
+		// ── Reconnect flow ────────────────────────────────────────────────
+		mainLog.Warn("[%s] 💀 Channel dead — reconnecting (backoff: %.0fs)", label, backoff.Seconds())
+		tm.setChannelPhase(idx, PhaseDisconnected, "channel dead, reconnecting...")
+
 		if currentQConn != nil {
 			tunnelPool.Remove(currentQConn)
+			currentQConn.CloseWithError(0, "reconnecting")
 		}
-		// Clean up old channel resources
 		if currentCh != nil {
-			go func(ch *channelState) {
-				ch.client.CleanupMessages()
-			}(currentCh)
+			go func(c *channelState) { c.client.CleanupMessages() }(currentCh)
 			time.Sleep(500 * time.Millisecond)
 			if currentCh.sfu != nil {
 				currentCh.sfu.Close()
@@ -934,7 +934,6 @@ func (tm *TunnelManager) monitorAndReconnect(
 			currentCh.client.Close()
 		}
 
-		// Remove from channels slice
 		mu.Lock()
 		for i, c := range *channels {
 			if c == currentCh {
@@ -944,45 +943,50 @@ func (tm *TunnelManager) monitorAndReconnect(
 		}
 		mu.Unlock()
 
-		// Backoff wait before cold reconnect
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
 		}
 
-		// Cold reconnection
-		mainLog.Info("[%s] 🔄 Reconnecting...", label)
 		tm.setChannelPhase(idx, PhaseBaleConnect, "")
 		newCh, newQConn := tm.initChannelTracked(ctx, idx, tp, label)
 		if newCh == nil || newQConn == nil {
 			mainLog.Warn("[%s] ❌ Reconnect failed — retrying in %.0fs", label, backoff.Seconds())
-			backoff = backoff * 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
+			backoff = minDuration(backoff*2, maxBackoff)
 			continue
 		}
 
-		// Success — add back to pool
 		tm.setChannelPhase(idx, PhaseTunnelActive, "")
 		tunnelPool.Add(newQConn, label)
 		mu.Lock()
 		*channels = append(*channels, newCh)
 		mu.Unlock()
-		mainLog.Info("[%s] ✅ Reconnected successfully!", label)
+		mainLog.Info("[%s] ✅ Reconnected!", label)
 
-		// Reset backoff on success
 		backoff = 3 * time.Second
 		currentQConn = newQConn
 		currentCh = newCh
 
-		// Start proxies if they haven't been started yet (edge case)
 		proxyOnce.Do(func() {
 			go startSOCKS5(ctx, "0.0.0.0:10909", tunnelPool)
 			go startHTTPProxy(ctx, "0.0.0.0:9095", tunnelPool)
 		})
+
+		// Brief stabilisation pause before resuming monitoring
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // initChannelTracked wraps initChannel with phase tracking callbacks.
@@ -1125,12 +1129,202 @@ func (tm *TunnelManager) initChannelTracked(ctx context.Context, idx int, tp con
 		return ch, qConn
 
 	} else {
-		// Soroush P2P uses yamux-over-DataChannel which is incompatible with the QUIC pool.
-		// TODO: wrap Soroush DC in a net.PacketConn adapter and dial QUIC over it.
-		tm.setChannelPhase(idx, PhaseError, "Soroush provider not yet supported in QUIC pool mode")
-		mainLog.Warn("[%s] Soroush provider not supported in QUIC pool — skipping", label)
-		client.Close()
-		return nil, nil
+		// ── Soroush P2P: WebRTC DataChannel → DCPacketConn → QUIC ──────────
+		mainLog.Info("[%s] ✅ Soroush call accepted! Setting up P2P WebRTC...", label)
+		tm.setChannelPhase(idx, PhaseSFUConnect, "Connecting P2P WebRTC...")
+
+		// Build ICE server list from call result
+		iceServers := make([]webrtc.ICEServer, 0, len(result.Connections))
+		for _, conn := range result.Connections {
+			ice := webrtc.ICEServer{URLs: []string{conn.URL}}
+			if conn.Username != "" {
+				ice.Username = conn.Username
+				ice.Credential = conn.Password
+				ice.CredentialType = webrtc.ICECredentialTypePassword
+			}
+			iceServers = append(iceServers, ice)
+		}
+
+		pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+			ICEServers:    iceServers,
+			BundlePolicy:  webrtc.BundlePolicyMaxBundle,
+			RTCPMuxPolicy: webrtc.RTCPMuxPolicyRequire,
+		})
+		if err != nil {
+			tm.setChannelPhase(idx, PhaseError, "PeerConnection failed: "+err.Error())
+			client.Close()
+			return nil, nil
+		}
+
+		// Dummy Opus track for call camouflage (DPI sees a voice call)
+		audioTrack, err := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+			"audio0", "soroush-voice-stream",
+		)
+		if err != nil || func() error { _, e := pc.AddTrack(audioTrack); return e }() != nil {
+			tm.setChannelPhase(idx, PhaseError, "Audio track failed")
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+
+		// DataChannel — ordered, reliable (message-oriented, so DCPacketConn works directly)
+		ordered := true
+		dc, err := pc.CreateDataChannel("quic-tunnel", &webrtc.DataChannelInit{Ordered: &ordered})
+		if err != nil {
+			tm.setChannelPhase(idx, PhaseError, "DataChannel failed: "+err.Error())
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+
+		// Channels for async signaling
+		pendingICE := make(chan string, 64)
+		dcOpenCh := make(chan *soroush.DCPacketConn, 1)
+
+		pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+			if c != nil {
+				select {
+				case pendingICE <- c.ToJSON().Candidate:
+				default:
+				}
+			}
+		})
+
+		// Wrap DC as PacketConn the moment it opens
+		dc.OnOpen(func() {
+			dcOpenCh <- soroush.NewDCPacketConn(dc)
+		})
+
+		// Create and send SDP offer
+		offer, err := pc.CreateOffer(nil)
+		if err != nil || pc.SetLocalDescription(offer) != nil {
+			tm.setChannelPhase(idx, PhaseError, "SDP offer failed")
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+		if err := client.SendTextMessage(tp.TargetUserID, soroush.FormatSDPOffer(offer.SDP)); err != nil {
+			tm.setChannelPhase(idx, PhaseError, "Send SDP offer failed")
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+
+		mainLog.Info("[%s] SDP offer sent. Waiting for answer...", label)
+		tm.setChannelPhase(idx, PhaseWaitTrack, "Waiting for SDP Answer...")
+
+		// SDP answer + ICE exchange goroutine
+		answerDone := make(chan struct{})
+		sdpCtx, sdpCancel := context.WithCancel(ctx)
+		defer sdpCancel()
+
+		go func() {
+			defer close(answerDone)
+			for {
+				select {
+				case <-sdpCtx.Done():
+					return
+				case text := <-client.GetTextMsgCh():
+					if soroush.IsSDPAnswer(text) {
+						sdpStr := soroush.ExtractSDP(text)
+						if err := pc.SetRemoteDescription(webrtc.SessionDescription{
+							Type: webrtc.SDPTypeAnswer, SDP: sdpStr,
+						}); err != nil {
+							mainLog.Error("[%s] SetRemoteDescription: %v", label, err)
+							return
+						}
+						// Drain pending ICE candidates
+						go func() {
+							for {
+								select {
+								case c := <-pendingICE:
+									client.SendTextMessage(tp.TargetUserID, soroush.FormatICECandidate(c))
+								case <-sdpCtx.Done():
+									return
+								}
+							}
+						}()
+						return
+					}
+					if soroush.IsICECandidate(text) {
+						pc.AddICECandidate(webrtc.ICECandidateInit{
+							Candidate: soroush.ExtractICECandidate(text),
+						})
+					}
+				}
+			}
+		}()
+
+		// Wait for SDP answer
+		select {
+		case <-answerDone:
+		case <-time.After(30 * time.Second):
+			tm.setChannelPhase(idx, PhaseError, "SDP Answer timeout (30s)")
+			pc.Close()
+			client.Close()
+			return nil, nil
+		case <-ctx.Done():
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+
+		mainLog.Info("[%s] SDP answered. Waiting for DataChannel open...", label)
+		tm.setChannelPhase(idx, PhaseTunnelSetup, "Waiting for DataChannel...")
+
+		var dcPC *soroush.DCPacketConn
+		select {
+		case dcPC = <-dcOpenCh:
+		case <-time.After(15 * time.Second):
+			tm.setChannelPhase(idx, PhaseError, "DataChannel open timeout (15s)")
+			pc.Close()
+			client.Close()
+			return nil, nil
+		case <-ctx.Done():
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+
+		// Dial QUIC over the DataChannel PacketConn
+		tm.setChannelPhase(idx, PhaseTunnelSetup, "Dialing QUIC over DataChannel...")
+		mainLog.Info("[%s] DataChannel open! Dialing QUIC...", label)
+
+		quicCfg := &quic.Config{
+			InitialPacketSize:              1200, // DC has no MTU constraint like Opus RTP
+			MaxIdleTimeout:                 30 * time.Second,
+			KeepAlivePeriod:                10 * time.Second,
+			InitialStreamReceiveWindow:     2 * 1024 * 1024,
+			MaxStreamReceiveWindow:         16 * 1024 * 1024,
+			InitialConnectionReceiveWindow: 4 * 1024 * 1024,
+			MaxConnectionReceiveWindow:     16 * 1024 * 1024,
+			DisablePathMTUDiscovery:        true,
+		}
+
+		dialCtx, dialCancel := context.WithTimeout(ctx, 20*time.Second)
+		qConn, err := quic.Dial(dialCtx, dcPC, soroush.RemoteDCAddr(), quicconn.ClientTLSConfig(), quicCfg)
+		dialCancel()
+		if err != nil {
+			tm.setChannelPhase(idx, PhaseError, "QUIC dial failed: "+err.Error())
+			mainLog.Info("[%s] QUIC dial: %v", label, err)
+			dcPC.Close()
+			pc.Close()
+			client.Close()
+			return nil, nil
+		}
+		mainLog.Info("[%s] ✅ QUIC connection established over Soroush DataChannel!", label)
+
+		ch := &channelState{
+			index:  tp.Index,
+			label:  label,
+			client: client,
+			pc:     pc,
+			qconn:  qConn,
+			cfg:    &chanCfg,
+			pair:   tp,
+		}
+		return ch, qConn
 	}
 }
 
