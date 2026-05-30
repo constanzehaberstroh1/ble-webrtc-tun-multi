@@ -84,6 +84,21 @@ func open(role string) (*Database, error) {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 
+	// Proactively handle SQLite ALTER TABLE NOT NULL / UNIQUE constraint issues for old databases
+	if db.Migrator().HasTable(&Account{}) {
+		if !db.Migrator().HasColumn(&Account{}, "external_id") {
+			dbLog.Info("Performing custom pre-migration: adding column external_id...")
+			if err := db.Exec(`ALTER TABLE accounts ADD COLUMN external_id INTEGER DEFAULT 0`).Error; err != nil {
+				dbLog.Error("Failed pre-migration ADD COLUMN: %v", err)
+			}
+		}
+
+		// Now the column definitely exists. Backfill it BEFORE AutoMigrate to ensure unique values!
+		dbLog.Info("Performing pre-migration backfill for multi-provider external_id...")
+		db.Exec(`UPDATE accounts SET provider_type = 'bale' WHERE provider_type = '' OR provider_type IS NULL`)
+		db.Exec(`UPDATE accounts SET external_id = bale_user_id WHERE (external_id = 0 OR external_id IS NULL) AND bale_user_id != 0`)
+	}
+
 	// Auto-migrate all models
 	if err := db.AutoMigrate(
 		&Account{},

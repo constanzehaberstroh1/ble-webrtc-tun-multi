@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
+	"github.com/quic-go/quic-go"
 	"github.com/pion/webrtc/v4"
 	"github.com/salman/ble-webrtc-tun/internal/accounts"
 	"github.com/salman/ble-webrtc-tun/internal/admin"
@@ -25,6 +27,7 @@ import (
 	"github.com/salman/ble-webrtc-tun/internal/livekit"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
 	"github.com/salman/ble-webrtc-tun/internal/provider"
+	"github.com/salman/ble-webrtc-tun/internal/quicconn"
 	"github.com/salman/ble-webrtc-tun/internal/router"
 	"github.com/salman/ble-webrtc-tun/internal/soroush"
 	"github.com/salman/ble-webrtc-tun/internal/transport"
@@ -134,17 +137,19 @@ func main() {
 		adminPanel.AddLog("info", "Proxy mode — userspace IP relay")
 	}
 
-	// Create obfuscator for anti-DPI payload encryption
+	// Obfuscation: XChaCha20-Poly1305 over RTP payloads.
+	// With QUIC (TLS 1.3) + WebRTC (DTLS/SRTP) the data is already triple-encrypted.
+	// Leave OBFUSCATION_SECRET empty for maximum speed — 40 bytes/pkt saved + less CPU.
 	if cfg.ObfuscationSecret != "" {
 		var err error
 		serverObf, err = dcconn.NewObfuscator(cfg.ObfuscationSecret)
 		if err != nil {
 			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
 		} else {
-			mainLog.Info("ChaCha20-Poly1305 obfuscation enabled (overhead: %d bytes/msg)", serverObf.Overhead())
+			mainLog.Warn("⚠️  XChaCha20 obfuscation ENABLED — REDUNDANT with QUIC+SRTP. Costs 40 bytes/pkt + CPU. Unset OBFUSCATION_SECRET for max speed.")
 		}
 	} else {
-		mainLog.Warn("No OBFUSCATION_SECRET set — traffic is not obfuscated (DPI visible)")
+		mainLog.Info("✅ Obfuscation disabled — QUIC TLS 1.3 + DTLS/SRTP provides full encryption. Full MTU available.")
 	}
 
 	// Bale signaling mode: connect to Bale WS, auto-accept calls
@@ -959,8 +964,7 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 
 
 func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTransport, adminPanel *admin.Server, baleClient provider.Client, tag string, callerID int64) {
-	// Wait for remote track (client's video through SFU)
-	adminPanel.AddLog("info", tag+" Waiting for client's video track via SFU (30s)...")
+	adminPanel.AddLog("info", tag+" Waiting for client track via SFU (30s)...")
 	mainLog.Info("%s Waiting for remote track...", tag)
 
 	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -971,39 +975,61 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	}
 
 	adminPanel.AddLog("info", tag+" Tunnel established via SFU!")
-	adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
-		s.TunnelActive = true
-	})
+	adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) { s.TunnelActive = true })
 
-	// Setup yamux server session over DataChannel
-	dc := sfu.DataConn()
-	if dc == nil {
-		adminPanel.AddLog("error", tag+" DataConn not ready")
+	// Setup QUIC server over the Opus RTP track
+	rtpConn := sfu.GetRTPConn()
+	if rtpConn == nil {
+		adminPanel.AddLog("error", tag+" RTP connection not ready")
 		return
 	}
 
-	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
-	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection (match client)
-	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission (match client)
-	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — must match client (was 1MB)
-	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections
-	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
-
-	session, err := yamux.Server(dc, ymuxCfg)
+	opusPC := quicconn.NewServer(rtpConn)
+	tlsCfg, err := quicconn.ServerTLSConfig()
 	if err != nil {
-		adminPanel.AddLog("error", tag+" Yamux server: "+err.Error())
+		adminPanel.AddLog("error", tag+" TLS config error: "+err.Error())
 		return
 	}
-	defer session.Close()
 
-	mainLog.Info("%s Yamux proxy active", tag)
-	go handleYamuxSession(session)
+	initPktSize := uint16(1140)
+	if serverObf != nil && serverObf.Enabled() {
+		initPktSize = 1100
+	}
+	quicCfg := &quic.Config{
+		InitialPacketSize:               initPktSize,
+		MaxIdleTimeout:                  30 * time.Second,
+		KeepAlivePeriod:                 5 * time.Second,
+		MaxIncomingStreams:              10000,
+		MaxIncomingUniStreams:           10000,
+		InitialStreamReceiveWindow:      2 * 1024 * 1024,
+		MaxStreamReceiveWindow:          16 * 1024 * 1024,
+		InitialConnectionReceiveWindow:  4 * 1024 * 1024,
+		MaxConnectionReceiveWindow:      16 * 1024 * 1024,
+		DisablePathMTUDiscovery:         true,
+	}
 
-	// Monitor
-	// Drain stale text messages (BLETUN:END from previous --disconnect runs)
-	// These get buffered in Bale chat and would immediately kill the new session
+	listener, err := quic.Listen(opusPC, tlsCfg, quicCfg)
+	if err != nil {
+		adminPanel.AddLog("error", tag+" QUIC listen failed: "+err.Error())
+		return
+	}
+	defer listener.Close()
+	mainLog.Info("%s QUIC listener ready", tag)
+
+	accCtx, accCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer accCancel()
+	qconn, err := listener.Accept(accCtx)
+	if err != nil {
+		adminPanel.AddLog("error", tag+" QUIC accept timeout: "+err.Error())
+		return
+	}
+	mainLog.Info("%s QUIC client connected — proxy active", tag)
+	adminPanel.AddLog("info", tag+" ✅ QUIC tunnel established!")
+	adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) { s.TunnelActive = true })
+
+	go handleQUICConn(ctx, qconn)
+
+	// Monitor: drain stale text messages + watch for END/ENDCALL signals
 drainLoop:
 	for {
 		select {
@@ -1014,71 +1040,90 @@ drainLoop:
 		}
 	}
 
-	// Grace period: ignore BLETUN:END for 10s after session start.
-	// Bale replays unread messages from chat history which may include
-	// old END messages from previous --disconnect runs.
 	sessionStart := time.Now()
 	gracePeriod := 10 * time.Second
-
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			mainLog.Info("%s Context cancelled", tag)
 			return
+		case <-qconn.Context().Done():
+			mainLog.Info("%s QUIC connection closed", tag)
+			return
 		case msg := <-baleClient.GetTextMsgCh():
 			if msg == "BLETUN:END" {
 				if time.Since(sessionStart) < gracePeriod {
-					mainLog.Info("%s Ignoring stale BLETUN:END (within %v grace period)", tag, gracePeriod)
+					mainLog.Info("%s Ignoring stale BLETUN:END (grace period)", tag)
 					continue
 				}
 				adminPanel.AddLog("info", tag+" Client sent END")
-				mainLog.Info("%s Client sent BLETUN:END", tag)
 				return
 			}
-			// Handle ENDCALL command — client requests server to end active call
-			// Send ACK immediately, then return to trigger the goroutine's cleanup
-			// (DiscardCall + router EndCall + CleanupMessages) which properly ends
-			// the Bale call and updates the server UI/router state.
 			if msg == "BLETUN:ENDCALL" {
-				mainLog.Info("%s 📴 Received ENDCALL command — ending active call", tag)
-				adminPanel.AddLog("info", tag+" 📴 ENDCALL received — ending call and sending ACK")
-				// Send acknowledgment to the client BEFORE returning
+				mainLog.Info("%s ENDCALL received", tag)
 				if callerID != 0 {
 					baleClient.SendTextMessage(callerID, "BLETUN:ENDCALL_ACK")
 				}
-				// Don't call CleanupMessages here — the goroutine cleanup after
-				// handleSFUProxy returns will handle DiscardCall (ends Bale call),
-				// callRouter.EndCall (updates server UI/router), and CleanupMessages.
 				return
-			}
-			// Handle terminal relay messages (BLECMD, BLERSZ, BLEEND)
-			if strings.HasPrefix(msg, "BLECMD:") || strings.HasPrefix(msg, "BLERSZ:") || strings.HasPrefix(msg, "BLEEND:") {
-				// Terminal relay removed — commands now go via VPN proxy
-				continue
 			}
 		case <-ticker.C:
-			if session.IsClosed() {
-				adminPanel.AddLog("warn", tag+" Yamux session closed")
-				mainLog.Info("%s Yamux session closed", tag)
-				return
-			}
 			stats := sfu.GetStats()
 			bytesSent, _ := stats["bytes_sent"].(int64)
 			bytesRecv, _ := stats["bytes_received"].(int64)
 			adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
-				// Compute speed (delta over 5s interval)
 				s.SpeedUp = (bytesSent - s.PrevBytesSent) / 5
 				s.SpeedDown = (bytesRecv - s.PrevBytesRecv) / 5
 				s.PrevBytesSent = bytesSent
 				s.PrevBytesRecv = bytesRecv
 				s.BytesSent = bytesSent
 				s.BytesReceived = bytesRecv
-				s.ActiveConns = session.NumStreams()
 			})
 		}
 	}
+}
+
+// handleQUICConn accepts streams from one QUIC connection and proxies each to the internet.
+func handleQUICConn(ctx context.Context, qconn quic.Connection) {
+	for {
+		stream, err := qconn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		go handleQUICStream(stream, qconn)
+	}
+}
+
+// handleQUICStream proxies one QUIC stream to the target address sent by the client.
+func handleQUICStream(stream quic.Stream, conn quic.Connection) {
+	defer stream.Close()
+
+	// Read 2-byte length-prefixed target address
+	var addrLen [2]byte
+	if _, err := io.ReadFull(stream, addrLen[:]); err != nil {
+		return
+	}
+	l := int(addrLen[0])<<8 | int(addrLen[1])
+	if l == 0 || l > 512 {
+		return
+	}
+	addr := make([]byte, l)
+	if _, err := io.ReadFull(stream, addr); err != nil {
+		return
+	}
+
+	target, err := net.Dial("tcp", string(addr))
+	if err != nil {
+		return
+	}
+	defer target.Close()
+
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(target, stream); done <- struct{}{} }()
+	go func() { io.Copy(stream, target); done <- struct{}{} }()
+	<-done
 }
 
 // handleBaleProxy handles one tunnel session: SDP exchange → WebRTC → proxy traffic.

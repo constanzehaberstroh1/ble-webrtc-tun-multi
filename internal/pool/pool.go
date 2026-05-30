@@ -1,313 +1,306 @@
+// Package pool manages a set of QUIC connections (one per WebRTC channel)
+// and provides flow-pinned load balancing with a Circuit Breaker.
+//
+// Circuit Breaker logic:
+//   - Channels with ≥3 consecutive stream failures are skipped entirely.
+//   - After 5 failures the connection is force-closed so monitorAndReconnect
+//     tears it down and re-dials a fresh WebRTC+QUIC channel.
+//   - Success resets the failure counter.
+//   - Stream timeout is 2s (was 5s) so black-hole connections fail fast.
 package pool
 
 import (
+	"context"
 	"fmt"
-	"github.com/salman/ble-webrtc-tun/internal/logger"
 	"math"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/yamux"
+	"github.com/quic-go/quic-go"
+	"github.com/salman/ble-webrtc-tun/internal/logger"
 )
 
 var poolLog = logger.New("pool")
 
-// TunnelPool manages multiple yamux sessions and provides
-// latency-aware load balancing across them.
-// Sessions with lower latency receive more traffic.
-// Dead sessions are detected proactively via periodic pings.
+// circuitBreakerThreshold is the number of consecutive stream open failures
+// after which a channel is excluded from load balancing.
+const circuitBreakerThreshold = int32(3)
+
+// circuitBreakerKill is the number of consecutive failures that triggers a
+// force-close of the QUIC connection, causing monitorAndReconnect to re-dial.
+const circuitBreakerKill = int32(5)
+
+// streamTimeout is how long OpenStreamSync waits before giving up.
+// 2s is intentionally short: failing fast lets the caller retry on a
+// healthy channel instead of blocking the proxy for 5-10 seconds.
+const streamTimeout = 2 * time.Second
+
+// TunnelPool manages multiple QUIC connections and distributes proxy streams
+// using a least-active-streams load balancer with circuit-breaker protection.
 type TunnelPool struct {
-	mu       sync.RWMutex
-	sessions []*PoolEntry
-	next     uint32
-	done     chan struct{}
-	once     sync.Once
+	mu      sync.RWMutex
+	entries []*PoolEntry
+	done    chan struct{}
+	once    sync.Once
 }
 
-// PoolEntry wraps a yamux session with metadata and latency tracking.
+// PoolEntry wraps one QUIC connection with stream-count and failure tracking.
 type PoolEntry struct {
-	Session    *yamux.Session
-	Index      int
-	Label      string        // e.g. "ch1", "ch2"
-	LatencyMs  atomic.Int64  // last measured RTT in milliseconds
-	FailCount  atomic.Int32  // consecutive stream open failures
-	LastPingAt atomic.Int64  // unix millis of last successful ping
+	Conn         quic.Connection
+	Label        string
+	ActiveStreams atomic.Int32 // streams currently open on this connection
+	FailCount    atomic.Int32 // consecutive stream open failures (circuit breaker)
+	addedAt      time.Time
 }
 
-// New creates a new empty TunnelPool and starts the background health monitor.
+// New creates a new empty TunnelPool with a background health monitor.
 func New() *TunnelPool {
-	p := &TunnelPool{
-		done: make(chan struct{}),
-	}
+	p := &TunnelPool{done: make(chan struct{})}
 	go p.healthMonitorLoop()
 	return p
 }
 
-// Add appends a session to the pool.
-func (p *TunnelPool) Add(session *yamux.Session, label string) {
+// Add registers a new QUIC connection in the pool.
+func (p *TunnelPool) Add(conn quic.Connection, label string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	idx := len(p.sessions)
-	entry := &PoolEntry{
-		Session: session,
-		Index:   idx,
+	p.entries = append(p.entries, &PoolEntry{
+		Conn:    conn,
 		Label:   label,
-	}
-	entry.LastPingAt.Store(time.Now().UnixMilli())
-	entry.LatencyMs.Store(50) // assume 50ms initial latency
-	p.sessions = append(p.sessions, entry)
-	poolLog.Info("Added session %s (total: %d)", label, len(p.sessions))
+		addedAt: time.Now(),
+	})
+	poolLog.Info("Added QUIC connection %s (total: %d)", label, len(p.entries))
 }
 
-// Replace swaps an old session with a new one in-place (for reconnection).
-// If oldSession is nil or not found, behaves like Add.
-func (p *TunnelPool) Replace(oldSession *yamux.Session, newSession *yamux.Session, label string) {
+// Remove removes a specific QUIC connection from the pool.
+func (p *TunnelPool) Remove(conn quic.Connection) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, e := range p.sessions {
-		if e.Session == oldSession {
-			e.Session = newSession
-			e.FailCount.Store(0)
-			e.LatencyMs.Store(50)
-			e.LastPingAt.Store(time.Now().UnixMilli())
-			poolLog.Info("Replaced session %s (hot-swap)", label)
+	for i, e := range p.entries {
+		if e.Conn == conn {
+			p.entries = append(p.entries[:i], p.entries[i+1:]...)
+			poolLog.Info("Removed QUIC connection %s (remaining: %d)", e.Label, len(p.entries))
 			return
 		}
 	}
-	// Not found — append as new
-	idx := len(p.sessions)
-	entry := &PoolEntry{
-		Session: newSession,
-		Index:   idx,
-		Label:   label,
-	}
-	entry.LastPingAt.Store(time.Now().UnixMilli())
-	entry.LatencyMs.Store(50)
-	p.sessions = append(p.sessions, entry)
-	poolLog.Info("Added session %s via Replace (total: %d)", label, len(p.sessions))
 }
 
-// GetSession returns the next healthy session using round-robin.
-// Skips closed sessions. Returns error if no sessions are available.
-func (p *TunnelPool) GetSession() (*yamux.Session, error) {
-	p.mu.RLock()
-	n := len(p.sessions)
-	if n == 0 {
-		p.mu.RUnlock()
-		return nil, fmt.Errorf("no active tunnels")
-	}
-	entries := make([]*PoolEntry, n)
-	copy(entries, p.sessions)
-	p.mu.RUnlock()
-
-	// Try each session starting from next index
-	start := atomic.AddUint32(&p.next, 1)
-	for i := 0; i < n; i++ {
-		idx := (int(start) + i) % n
-		s := entries[idx].Session
-		if s != nil && !s.IsClosed() {
-			return s, nil
-		}
-	}
-
-	return nil, fmt.Errorf("all %d tunnels are closed", n)
-}
-
-// OpenStream opens a yamux stream on the best available session.
-// Uses latency-weighted selection: prefers sessions with lower latency.
-// Falls back to round-robin if latency data is unavailable.
+// OpenStream opens a QUIC stream on the least-loaded HEALTHY connection.
+//
+// Circuit breaker: channels with ≥ circuitBreakerThreshold consecutive
+// failures are excluded. Their effective load is treated as MaxInt32 so
+// the balancer always prefers a fresh channel. After circuitBreakerKill
+// failures the connection is force-closed to trigger re-dial.
+//
+// Returns a trackedStream that auto-decrements ActiveStreams on Close().
 func (p *TunnelPool) OpenStream() (net.Conn, error) {
 	p.mu.RLock()
-	n := len(p.sessions)
-	if n == 0 {
-		p.mu.RUnlock()
-		return nil, fmt.Errorf("no active tunnels")
-	}
-	entries := make([]*PoolEntry, n)
-	copy(entries, p.sessions)
+	entries := make([]*PoolEntry, len(p.entries))
+	copy(entries, p.entries)
 	p.mu.RUnlock()
 
-	// Collect healthy sessions with their latencies
-	type candidate struct {
-		entry   *PoolEntry
-		latency int64
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no active tunnels")
 	}
-	var candidates []candidate
+
+	// ── Circuit-Breaker Selection ──────────────────────────────────────────
+	// Score each entry: activeStreams + huge penalty per failure.
+	// Entries with ≥ threshold failures are skipped entirely.
+	var best *PoolEntry
+	bestScore := int32(math.MaxInt32)
+
 	for _, e := range entries {
-		if e.Session == nil || e.Session.IsClosed() {
+		if e.Conn == nil {
 			continue
 		}
-		lat := e.LatencyMs.Load()
-		// Penalize sessions with recent failures
+		// Skip connections that are internally dead
+		select {
+		case <-e.Conn.Context().Done():
+			continue
+		default:
+		}
+
 		fails := e.FailCount.Load()
-		if fails > 0 {
-			lat += int64(fails) * 200 // +200ms penalty per failure
-		}
-		candidates = append(candidates, candidate{entry: e, latency: lat})
-	}
-
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("all %d tunnels are closed", n)
-	}
-
-	// Weighted selection: try lowest-latency first, then fall back
-	// Sort candidates by latency (simple insertion sort for small N)
-	for i := 1; i < len(candidates); i++ {
-		for j := i; j > 0 && candidates[j].latency < candidates[j-1].latency; j-- {
-			candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
-		}
-	}
-
-	// Use weighted round-robin: sessions with 2x latency get 1/2 the traffic.
-	// The base latency is the fastest session. We distribute proportionally.
-	if len(candidates) > 1 {
-		baseLat := candidates[0].latency
-		if baseLat < 1 {
-			baseLat = 1
-		}
-		// Use a counter to distribute — faster sessions get more turns
-		counter := atomic.AddUint32(&p.next, 1)
-		totalWeight := 0.0
-		weights := make([]float64, len(candidates))
-		for i, c := range candidates {
-			w := float64(baseLat) / math.Max(float64(c.latency), 1.0)
-			weights[i] = w
-			totalWeight += w
-		}
-		// Weighted selection using the counter
-		target := math.Mod(float64(counter), totalWeight)
-		cumulative := 0.0
-		selectedIdx := 0
-		for i, w := range weights {
-			cumulative += w
-			if target < cumulative {
-				selectedIdx = i
-				break
-			}
-		}
-		// Try the selected candidate first, then fall through
-		reordered := make([]candidate, 0, len(candidates))
-		reordered = append(reordered, candidates[selectedIdx])
-		for i, c := range candidates {
-			if i != selectedIdx {
-				reordered = append(reordered, c)
-			}
-		}
-		candidates = reordered
-	}
-
-	// Try each candidate in weighted order
-	for _, c := range candidates {
-		stream, err := c.entry.Session.Open()
-		if err != nil {
-			c.entry.FailCount.Add(1)
-			poolLog.Warn("Stream open failed on %s (fails=%d): %v",
-				c.entry.Label, c.entry.FailCount.Load(), err)
+		if fails >= circuitBreakerThreshold {
+			// Channel is in circuit-breaker state — skip it
+			poolLog.Warn("[CB] Skipping %s (fails=%d, circuit open)", e.Label, fails)
 			continue
 		}
-		// Reset fail count on success
-		if c.entry.FailCount.Load() > 0 {
-			c.entry.FailCount.Store(0)
+
+		// Score: active streams + 100 penalty per failure (so 2 failures = heavy penalty)
+		score := e.ActiveStreams.Load() + fails*100
+		if best == nil || score < bestScore {
+			bestScore = score
+			best = e
 		}
-		return stream, nil
 	}
 
-	return nil, fmt.Errorf("all %d tunnels failed to open stream", n)
+	if best == nil {
+		// All channels are either dead or circuit-broken.
+		// Count how many are just circuit-broken (not fully dead) — they may recover.
+		broken := 0
+		for _, e := range entries {
+			if e.FailCount.Load() >= circuitBreakerThreshold {
+				broken++
+			}
+		}
+		if broken > 0 {
+			return nil, fmt.Errorf("all %d tunnels in circuit-breaker lockdown (broken=%d)", len(entries), broken)
+		}
+		return nil, fmt.Errorf("all %d tunnels are closed", len(entries))
+	}
+
+	// ── Open Stream with Fast Timeout ─────────────────────────────────────
+	ctx, cancel := context.WithTimeout(context.Background(), streamTimeout)
+	defer cancel()
+
+	stream, err := best.Conn.OpenStreamSync(ctx)
+	if err != nil {
+		newFails := best.FailCount.Add(1)
+		poolLog.Warn("[CB] Stream open failed on %s (fails=%d): %v", best.Label, newFails, err)
+
+		// Kill the connection if it keeps failing — forces monitorAndReconnect
+		if newFails >= circuitBreakerKill {
+			poolLog.Warn("[CB] Circuit breaker KILL: force-closing %s after %d failures", best.Label, newFails)
+			best.Conn.CloseWithError(1, "circuit breaker: stream exhaustion")
+		}
+
+		return nil, fmt.Errorf("open stream on %s: %w", best.Label, err)
+	}
+
+	// ── Success — reset circuit breaker ───────────────────────────────────
+	if old := best.FailCount.Swap(0); old > 0 {
+		poolLog.Info("[CB] %s recovered (was fails=%d)", best.Label, old)
+	}
+	best.ActiveStreams.Add(1)
+	poolLog.Info("Opened stream on %s (active: %d)", best.Label, best.ActiveStreams.Load())
+
+	return &trackedStream{
+		Conn:  wrapQUICStream(stream, best.Conn),
+		entry: best,
+	}, nil
 }
 
-// ActiveCount returns the number of non-closed sessions.
+// ActiveCount returns the number of QUIC connections that are still alive.
 func (p *TunnelPool) ActiveCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	count := 0
-	for _, e := range p.sessions {
-		if e.Session != nil && !e.Session.IsClosed() {
-			count++
+	for _, e := range p.entries {
+		if e.Conn != nil {
+			select {
+			case <-e.Conn.Context().Done():
+			default:
+				count++
+			}
 		}
 	}
 	return count
 }
 
-// Remove removes closed sessions from the pool.
-func (p *TunnelPool) Remove(session *yamux.Session) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for i, e := range p.sessions {
-		if e.Session == session {
-			p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
-			poolLog.Info("Removed session %s (remaining: %d)", e.Label, len(p.sessions))
-			return
-		}
-	}
-}
-
-// CloseAll closes all sessions in the pool and stops the health monitor.
+// CloseAll closes all QUIC connections and stops the health monitor.
 func (p *TunnelPool) CloseAll() {
-	p.once.Do(func() {
-		close(p.done)
-	})
+	p.once.Do(func() { close(p.done) })
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, e := range p.sessions {
-		if e.Session != nil {
-			e.Session.Close()
+	for _, e := range p.entries {
+		if e.Conn != nil {
+			e.Conn.CloseWithError(0, "tunnel stopped")
 		}
 	}
-	p.sessions = nil
-	poolLog.Info("All sessions closed")
+	p.entries = nil
+	poolLog.Info("All QUIC connections closed")
 }
 
-// Sessions returns a snapshot of all entries.
-func (p *TunnelPool) Sessions() []*PoolEntry {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make([]*PoolEntry, len(p.sessions))
-	copy(out, p.sessions)
-	return out
-}
-
-// healthMonitorLoop periodically pings all sessions to measure latency
-// and detect dead connections proactively.
+// healthMonitorLoop logs pool status and evicts zombie entries every 5s.
 func (p *TunnelPool) healthMonitorLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-p.done:
 			return
 		case <-ticker.C:
-			p.pingAllSessions()
-		}
-	}
-}
-
-// pingAllSessions measures RTT to all active sessions.
-func (p *TunnelPool) pingAllSessions() {
-	p.mu.RLock()
-	entries := make([]*PoolEntry, len(p.sessions))
-	copy(entries, p.sessions)
-	p.mu.RUnlock()
-
-	for _, e := range entries {
-		if e.Session == nil || e.Session.IsClosed() {
-			continue
-		}
-		go func(entry *PoolEntry) {
-			start := time.Now()
-			rtt, err := entry.Session.Ping()
-			if err != nil {
-				// Ping failed — mark high latency but don't remove
-				// (auto-reconnect will handle dead sessions)
-				entry.LatencyMs.Store(5000) // 5s = "very slow"
-				return
+			p.mu.Lock()
+			live := p.entries[:0]
+			for _, e := range p.entries {
+				select {
+				case <-e.Conn.Context().Done():
+					// Dead AND no active streams — safe to evict from pool
+					if e.ActiveStreams.Load() <= 0 {
+						poolLog.Warn("[Health] Evicting dead entry %s", e.Label)
+						continue // don't keep it
+					}
+				default:
+				}
+				fails := e.FailCount.Load()
+				streams := e.ActiveStreams.Load()
+				if fails >= circuitBreakerThreshold {
+					poolLog.Warn("[Health] %s: CIRCUIT OPEN (fails=%d, streams=%d)", e.Label, fails, streams)
+				} else {
+					poolLog.Info("[Health] %s: alive (fails=%d, streams=%d)", e.Label, fails, streams)
+				}
+				live = append(live, e)
 			}
-			_ = rtt
-			latencyMs := time.Since(start).Milliseconds()
-			entry.LatencyMs.Store(latencyMs)
-			entry.LastPingAt.Store(time.Now().UnixMilli())
-		}(e)
+			p.entries = live
+			p.mu.Unlock()
+		}
 	}
 }
+
+// ─── trackedStream ────────────────────────────────────────────────────────────
+
+type trackedStream struct {
+	net.Conn
+	entry *PoolEntry
+	once  sync.Once
+}
+
+func (s *trackedStream) Close() error {
+	s.once.Do(func() {
+		if s.entry.ActiveStreams.Add(-1) < 0 {
+			s.entry.ActiveStreams.Store(0)
+		}
+		poolLog.Info("Stream closed on %s (active: %d)", s.entry.Label, s.entry.ActiveStreams.Load())
+	})
+	return s.Conn.Close()
+}
+
+// ─── quicStreamConn ───────────────────────────────────────────────────────────
+
+type quicStreamConn struct {
+	quic.Stream
+	local  net.Addr
+	remote net.Addr
+}
+
+func wrapQUICStream(s quic.Stream, conn quic.Connection) net.Conn {
+	return &quicStreamConn{
+		Stream: s,
+		local:  conn.LocalAddr(),
+		remote: conn.RemoteAddr(),
+	}
+}
+
+func (c *quicStreamConn) LocalAddr() net.Addr  { return c.local }
+func (c *quicStreamConn) RemoteAddr() net.Addr { return c.remote }
+
+// ─── Compatibility shims ──────────────────────────────────────────────────────
+
+func (p *TunnelPool) Sessions() []*PoolEntry {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]*PoolEntry, len(p.entries))
+	copy(out, p.entries)
+	return out
+}
+
+// LatencyMs returns a placeholder (QUIC pool measures stream counts, not RTT).
+func (e *PoolEntry) LatencyMs() int64 { return 0 }
+
+// next is used by legacy callers; no-op in QUIC pool.
+var _next uint32
+
+func init() { atomic.StoreUint32(&_next, 0) }
