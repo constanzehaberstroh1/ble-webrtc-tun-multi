@@ -128,15 +128,30 @@ func (s *Server) createPairing(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/pairings/{id}
 func (s *Server) deletePairing(w http.ResponseWriter, _ *http.Request, id uint) {
 	// Get pairing info before deletion for remote sync
-	pairing, _ := s.manager.ListPairings()
-	var clientBaleID, serverBaleID int64
-	for _, p := range pairing {
+	pairingList, _ := s.manager.ListPairings()
+	var clientProvType, serverProvType string
+	var clientExtID, serverExtID int64
+	for _, p := range pairingList {
 		if p.ID == id {
 			if p.ClientAccount != nil {
-				clientBaleID = p.ClientAccount.BaleUserID
+				clientProvType = p.ClientAccount.ProviderType
+				if clientProvType == "" {
+					clientProvType = "bale"
+				}
+				clientExtID = p.ClientAccount.ExternalID
+				if clientExtID == 0 {
+					clientExtID = p.ClientAccount.BaleUserID
+				}
 			}
 			if p.ServerAccount != nil {
-				serverBaleID = p.ServerAccount.BaleUserID
+				serverProvType = p.ServerAccount.ProviderType
+				if serverProvType == "" {
+					serverProvType = "bale"
+				}
+				serverExtID = p.ServerAccount.ExternalID
+				if serverExtID == 0 {
+					serverExtID = p.ServerAccount.BaleUserID
+				}
 			}
 			break
 		}
@@ -150,8 +165,8 @@ func (s *Server) deletePairing(w http.ResponseWriter, _ *http.Request, id uint) 
 	bumpDataVersion()
 
 	// Push pairing delete to remote
-	if s.RemoteServerURL != "" && clientBaleID != 0 && serverBaleID != 0 {
-		go s.pushPairingDeleteToRemote(clientBaleID, serverBaleID)
+	if s.RemoteServerURL != "" && clientExtID != 0 && serverExtID != 0 {
+		go s.pushPairingDeleteToRemote(clientProvType, clientExtID, serverProvType, serverExtID)
 	}
 
 	writeOK(w, "pairing deleted")
@@ -186,9 +201,31 @@ func (s *Server) pushPairingToRemote(clientAccountID, serverAccountID uint) {
 		return
 	}
 
+	clientProv := clientAcct.ProviderType
+	if clientProv == "" {
+		clientProv = "bale"
+	}
+	clientExtID := clientAcct.ExternalID
+	if clientExtID == 0 {
+		clientExtID = clientAcct.BaleUserID
+	}
+
+	serverProv := serverAcct.ProviderType
+	if serverProv == "" {
+		serverProv = "bale"
+	}
+	serverExtID := serverAcct.ExternalID
+	if serverExtID == 0 {
+		serverExtID = serverAcct.BaleUserID
+	}
+
 	payload := map[string]interface{}{
-		"client_bale_user_id": clientAcct.BaleUserID,
-		"server_bale_user_id": serverAcct.BaleUserID,
+		"client_provider_type": clientProv,
+		"client_external_id":   clientExtID,
+		"client_bale_user_id":  clientExtID, // backward compat
+		"server_provider_type": serverProv,
+		"server_external_id":   serverExtID,
+		"server_bale_user_id":  serverExtID, // backward compat
 	}
 	body, _ := json.Marshal(payload)
 
@@ -198,14 +235,18 @@ func (s *Server) pushPairingToRemote(clientAccountID, serverAccountID uint) {
 		return
 	}
 	resp.Body.Close()
-	apiLog.Info("Pushed pairing to remote server (client=%d server=%d)", clientAcct.BaleUserID, serverAcct.BaleUserID)
+	apiLog.Info("Pushed pairing to remote (%s/%d ↔ %s/%d)", clientProv, clientExtID, serverProv, serverExtID)
 }
 
 // pushPairingDeleteToRemote notifies the remote server about a deleted pairing.
-func (s *Server) pushPairingDeleteToRemote(clientBaleID, serverBaleID int64) {
+func (s *Server) pushPairingDeleteToRemote(clientProvType string, clientExtID int64, serverProvType string, serverExtID int64) {
 	payload := map[string]interface{}{
-		"client_bale_user_id": clientBaleID,
-		"server_bale_user_id": serverBaleID,
+		"client_provider_type": clientProvType,
+		"client_external_id":   clientExtID,
+		"client_bale_user_id":  clientExtID, // backward compat
+		"server_provider_type": serverProvType,
+		"server_external_id":   serverExtID,
+		"server_bale_user_id":  serverExtID, // backward compat
 	}
 	body, _ := json.Marshal(payload)
 
@@ -215,7 +256,7 @@ func (s *Server) pushPairingDeleteToRemote(clientBaleID, serverBaleID int64) {
 		return
 	}
 	resp.Body.Close()
-	apiLog.Info("Pushed pairing delete to remote (client=%d server=%d)", clientBaleID, serverBaleID)
+	apiLog.Info("Pushed pairing delete to remote (%s/%d ↔ %s/%d)", clientProvType, clientExtID, serverProvType, serverExtID)
 }
 
 // pushAllPairingsToRemote pushes all current pairings to the remote server.

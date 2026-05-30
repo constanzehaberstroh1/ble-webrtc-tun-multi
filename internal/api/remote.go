@@ -368,11 +368,13 @@ func (s *Server) handleRemotePullAccounts(w http.ResponseWriter, r *http.Request
 	}
 
 	var remoteAccounts []struct {
-		BaleUserID  int64  `json:"bale_user_id"`
-		Role        string `json:"role"`
-		DisplayName string `json:"display_name"`
-		Phone       string `json:"phone"`
-		Enabled     bool   `json:"enabled"`
+		ProviderType string `json:"provider_type"`
+		ExternalID   int64  `json:"external_id"`
+		BaleUserID   int64  `json:"bale_user_id"` // fallback for legacy servers
+		Role         string `json:"role"`
+		DisplayName  string `json:"display_name"`
+		Phone        string `json:"phone"`
+		Enabled      bool   `json:"enabled"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&remoteAccounts); err != nil {
 		writeError(w, http.StatusBadGateway, "failed to decode remote accounts")
@@ -388,13 +390,22 @@ func (s *Server) handleRemotePullAccounts(w http.ResponseWriter, r *http.Request
 			continue
 		}
 
-		if ra.BaleUserID == 0 {
+		// Resolve provider + external ID (support both new and legacy fields)
+		provType := ra.ProviderType
+		if provType == "" {
+			provType = "bale"
+		}
+		extID := ra.ExternalID
+		if extID == 0 {
+			extID = ra.BaleUserID
+		}
+		if extID == 0 {
 			skipped++
 			continue
 		}
 
 		// Check if already exists locally
-		existing, _ := s.database.GetAccountByBaleUserID(ra.BaleUserID)
+		existing, _ := s.database.GetAccountByExternalID(provType, extID)
 		if existing != nil {
 			// Update display info if needed
 			if (ra.DisplayName != "" && ra.DisplayName != existing.DisplayName) ||
@@ -406,9 +417,9 @@ func (s *Server) handleRemotePullAccounts(w http.ResponseWriter, r *http.Request
 		}
 
 		// Create locally (no token needed — just a reference for pairing)
-		acct, err := s.database.CreateAccount("", ra.Role, ra.BaleUserID)
+		acct, err := s.database.CreateAccountWithProvider("", ra.Role, extID, provType)
 		if err != nil {
-			apiLog.Warn("Pull: failed to create account %d: %v", ra.BaleUserID, err)
+			apiLog.Warn("Pull: failed to create %s account %d: %v", provType, extID, err)
 			skipped++
 			continue
 		}
@@ -416,7 +427,7 @@ func (s *Server) handleRemotePullAccounts(w http.ResponseWriter, r *http.Request
 			s.database.UpdateAccountInfo(acct.ID, ra.DisplayName, ra.Phone, 0)
 		}
 		inserted++
-		apiLog.Info("Pulled SERVER account from remote: Bale %d (%s)", ra.BaleUserID, ra.DisplayName)
+		apiLog.Info("Pulled SERVER account from remote: %s/%d (%s)", provType, extID, ra.DisplayName)
 	}
 
 	if inserted > 0 {
@@ -457,30 +468,35 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Use db.Account directly since the snapshot returns the full Account struct
 	var snapshot struct {
-		Version  int64 `json:"version"`
+		Version  int64       `json:"version"`
 		Accounts []struct {
-			BaleUserID  int64  `json:"bale_user_id"`
-			Role        string `json:"role"`
-			DisplayName string `json:"display_name"`
-			Phone       string `json:"phone"`
-			Enabled     bool   `json:"enabled"`
+			ProviderType string `json:"provider_type"`
+			ExternalID   int64  `json:"external_id"`
+			BaleUserID   int64  `json:"bale_user_id"` // fallback
+			Role         string `json:"role"`
+			DisplayName  string `json:"display_name"`
+			Phone        string `json:"phone"`
+			Enabled      bool   `json:"enabled"`
 		} `json:"accounts"`
 		Pairings []struct {
 			ClientAccountID uint `json:"client_account_id"`
 			ServerAccountID uint `json:"server_account_id"`
 			Active          bool `json:"active"`
 			ClientAccount   *struct {
-				BaleUserID  int64  `json:"bale_user_id"`
-				Role        string `json:"role"`
-				DisplayName string `json:"display_name"`
-				Phone       string `json:"phone"`
+				ProviderType string `json:"provider_type"`
+				ExternalID   int64  `json:"external_id"`
+				BaleUserID   int64  `json:"bale_user_id"`
+				Role         string `json:"role"`
+				DisplayName  string `json:"display_name"`
 			} `json:"client_account"`
 			ServerAccount *struct {
-				BaleUserID  int64  `json:"bale_user_id"`
-				Role        string `json:"role"`
-				DisplayName string `json:"display_name"`
-				Phone       string `json:"phone"`
+				ProviderType string `json:"provider_type"`
+				ExternalID   int64  `json:"external_id"`
+				BaleUserID   int64  `json:"bale_user_id"`
+				Role         string `json:"role"`
+				DisplayName  string `json:"display_name"`
 			} `json:"server_account"`
 		} `json:"pairings"`
 	}
@@ -493,13 +509,28 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 	accountsUpdated := 0
 	pairingsInserted := 0
 
+	// helper: resolve provider+ID from either new or legacy fields
+	resolveAccount := func(provType string, extID, baleID int64) (string, int64) {
+		if provType == "" {
+			provType = "bale"
+		}
+		if extID == 0 {
+			extID = baleID
+		}
+		return provType, extID
+	}
+
 	// 2. Sync SERVER accounts from remote (client manages its own CLIENT accounts)
 	for _, ra := range snapshot.Accounts {
-		if ra.Role != "SERVER" || ra.BaleUserID == 0 {
+		if ra.Role != "SERVER" {
+			continue
+		}
+		provType, extID := resolveAccount(ra.ProviderType, ra.ExternalID, ra.BaleUserID)
+		if extID == 0 {
 			continue
 		}
 
-		existing, _ := s.database.GetAccountByBaleUserID(ra.BaleUserID)
+		existing, _ := s.database.GetAccountByExternalID(provType, extID)
 		if existing != nil {
 			// Update display info if changed
 			changed := false
@@ -516,15 +547,17 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 			continue
 		}
 
-		// Create new SERVER account locally
-		acct, err := s.database.CreateAccount("", ra.Role, ra.BaleUserID)
+		// Create new SERVER account locally with correct provider type
+		acct, err := s.database.CreateAccountWithProvider("", ra.Role, extID, provType)
 		if err != nil {
+			apiLog.Warn("Sync: failed to create %s account %d: %v", provType, extID, err)
 			continue
 		}
 		if ra.DisplayName != "" || ra.Phone != "" {
 			s.database.UpdateAccountInfo(acct.ID, ra.DisplayName, ra.Phone, 0)
 		}
 		accountsInserted++
+		apiLog.Info("Sync: imported SERVER account %s/%d (%s)", provType, extID, ra.DisplayName)
 	}
 
 	// 3. Sync pairings from remote
@@ -533,9 +566,15 @@ func (s *Server) handleRemoteSyncFromServer(w http.ResponseWriter, r *http.Reque
 			continue
 		}
 
-		clientAcct, _ := s.database.GetAccountByBaleUserID(rp.ClientAccount.BaleUserID)
-		serverAcct, _ := s.database.GetAccountByBaleUserID(rp.ServerAccount.BaleUserID)
+		clientProv, clientExtID := resolveAccount(rp.ClientAccount.ProviderType, rp.ClientAccount.ExternalID, rp.ClientAccount.BaleUserID)
+		serverProv, serverExtID := resolveAccount(rp.ServerAccount.ProviderType, rp.ServerAccount.ExternalID, rp.ServerAccount.BaleUserID)
+
+		clientAcct, _ := s.database.GetAccountByExternalID(clientProv, clientExtID)
+		serverAcct, _ := s.database.GetAccountByExternalID(serverProv, serverExtID)
 		if clientAcct == nil || serverAcct == nil {
+			apiLog.Warn("Sync: skipping pairing — client=%s/%d found=%v, server=%s/%d found=%v",
+				clientProv, clientExtID, clientAcct != nil,
+				serverProv, serverExtID, serverAcct != nil)
 			continue
 		}
 

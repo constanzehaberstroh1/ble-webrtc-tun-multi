@@ -612,6 +612,10 @@ func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
 		if clientProv == "" {
 			clientProv = "bale"
 		}
+		serverProv := p.ServerAccount.ProviderType
+		if serverProv == "" {
+			serverProv = "bale"
+		}
 
 		if clientProv == "bale" && p.ClientAccount.Token == "" {
 			mainLog.Warn("[Manager] Client account %d has empty token — skipping", p.ClientAccount.ID)
@@ -622,14 +626,10 @@ func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
 			continue
 		}
 
-		var targetID int64
-		if clientProv == "soroush" {
-			targetID = p.ServerAccount.ExternalID
-		} else {
+		// Always use ExternalID — works for any provider combination (bale↔bale, soroush↔soroush, bale↔soroush)
+		targetID := p.ServerAccount.ExternalID
+		if targetID == 0 {
 			targetID = p.ServerAccount.BaleUserID
-			if targetID == 0 {
-				targetID = p.ServerAccount.ExternalID
-			}
 		}
 
 		pairs = append(pairs, config.TokenPair{
@@ -642,9 +642,9 @@ func (tm *TunnelManager) loadPairsFromDB() ([]config.TokenPair, string, error) {
 			ServerSalt:   p.ClientAccount.ServerSalt,
 			AccessHash:   p.ServerAccount.AccessHash,
 		})
-		mainLog.Info("[Manager] Pair %d: client=%d (ext=%d) → server=%d (ext=%d) [owner=%s, provider=%s]",
-			i+1, p.ClientAccountID, p.ClientAccount.ExternalID,
-			p.ServerAccountID, p.ServerAccount.ExternalID, tm.clientID, clientProv)
+		mainLog.Info("[Manager] Pair %d: client=%d (%s ext=%d) → server=%d (%s ext=%d) [owner=%s]",
+			i+1, p.ClientAccountID, clientProv, p.ClientAccount.ExternalID,
+			p.ServerAccountID, serverProv, p.ServerAccount.ExternalID, tm.clientID)
 	}
 
 	if len(pairs) == 0 {
@@ -1744,7 +1744,7 @@ func detectRemoteServerURL() string {
 	}
 
 	// 3. Hardcoded fallback for known Clever Cloud deployment
-	const fallbackURL = "https://app-7c1a120b-18c6-43fd-850c-b2883b209c3d.cleverapps.io"
+	const fallbackURL = "https://app-1940b1ac-3072-43ff-a004-68e1a738e316.cleverapps.io"
 	return fallbackURL
 }
 
