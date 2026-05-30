@@ -19,7 +19,6 @@ import (
 	"github.com/pion/webrtc/v3"
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/dcconn"
-	"github.com/salman/ble-webrtc-tun/internal/kcptun"
 	"github.com/salman/ble-webrtc-tun/internal/rtpconn"
 	"google.golang.org/protobuf/proto"
 
@@ -51,9 +50,8 @@ type SFUTransport struct {
 	dataConn *dcconn.Conn        // io.ReadWriteCloser for yamux (DC mode)
 
 	// RTP audio tunnel (primary — DPI evasion)
-	rtpDataConn *rtpconn.Conn    // io.ReadWriteCloser for yamux (RTP mode)
-	kcpConn     *kcptun.Conn     // KCP reliability wrapper
-	useRTP      bool             // true = tunnel via Opus RTP, false = DC fallback
+	rtpDataConn *rtpconn.Conn // io.ReadWriteCloser for QUIC (RTP mode)
+	useRTP      bool          // true = tunnel via Opus RTP
 
 	// Obfuscation layer (anti-DPI)
 	obfuscator *dcconn.Obfuscator
@@ -442,26 +440,22 @@ func (s *SFUTransport) handleSubscriberOffer(offer *lkproto.SessionDescription) 
 	return s.sendSignal(req)
 }
 
-// DataConn returns the io.ReadWriteCloser for yamux.
-// In RTP mode, returns the rtpconn wrapped in KCP (with secret-derived conv ID);
-// in DC mode, returns the dcconn.
-func (s *SFUTransport) DataConn() io.ReadWriteCloser {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.useRTP && s.rtpDataConn != nil {
-		if s.kcpConn == nil {
-			// Derive KCP conversation ID from the obfuscation secret
-			// so the conv ID itself isn't a recognizable fingerprint.
-			secret := ""
-			if s.cfg != nil {
-				secret = s.cfg.ObfuscationSecret
-			}
-			sfuLog.Info("Wrapping RTP connection with KCP reliability layer (conv_id derived from secret)")
-			s.kcpConn = kcptun.WrapWithSecret(s.rtpDataConn, secret)
-		}
-		return s.kcpConn
+// GetRTPConn returns the underlying rtpconn for QUIC transport wrapping.
+// Returns nil if not in RTP mode. Callers wrap this with quicconn.OpusPacketConn
+// and pass it to quic.Dial / quic.Listen.
+func (s *SFUTransport) GetRTPConn() *rtpconn.Conn {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.useRTP {
+		return s.rtpDataConn
 	}
-	return s.dataConn
+	return nil
+}
+
+// DataConn is kept for backward compatibility but always returns nil in QUIC mode.
+// Use GetRTPConn() instead.
+func (s *SFUTransport) DataConn() io.ReadWriteCloser {
+	return nil
 }
 
 // GetStats returns traffic stats.
@@ -567,9 +561,6 @@ func (s *SFUTransport) Close() error {
 	}
 	if s.subPC != nil {
 		s.subPC.Close()
-	}
-	if s.kcpConn != nil {
-		s.kcpConn.Close()
 	}
 	if s.conn != nil {
 		s.conn.Close()

@@ -132,8 +132,13 @@ export function PairingsPage() {
       render: (_: any, r: any) => (
         <Space>
           <Tag color="purple">CLIENT</Tag>
+          {r.client_account?.provider_type && (
+            <Tag color={r.client_account.provider_type === 'soroush' ? 'orange' : 'green'} style={{ fontSize: 10, fontWeight: 'bold' }}>
+              {r.client_account.provider_type.toUpperCase()}
+            </Tag>
+          )}
           <Text type="secondary" className="font-mono">
-            {r.client_account?.bale_user_id || r.client_account_id}
+            {r.client_account?.external_id || r.client_account?.bale_user_id || r.client_account_id}
           </Text>
           {r.client_account?.display_name && (
             <Text type="secondary" style={{ fontSize: 11 }}>({r.client_account.display_name})</Text>
@@ -147,8 +152,13 @@ export function PairingsPage() {
       render: (_: any, r: any) => (
         <Space>
           <Tag color="blue">SERVER</Tag>
+          {r.server_account?.provider_type && (
+            <Tag color={r.server_account.provider_type === 'soroush' ? 'orange' : 'green'} style={{ fontSize: 10, fontWeight: 'bold' }}>
+              {r.server_account.provider_type.toUpperCase()}
+            </Tag>
+          )}
           <Text type="secondary" className="font-mono">
-            {r.server_account?.bale_user_id || r.server_account_id}
+            {r.server_account?.external_id || r.server_account?.bale_user_id || r.server_account_id}
           </Text>
           {r.server_account?.display_name && (
             <Text type="secondary" style={{ fontSize: 11 }}>({r.server_account.display_name})</Text>
@@ -267,7 +277,7 @@ export function PairingsPage() {
             <Select placeholder="Select client...">
               {clients.map((c: any) => (
                 <Select.Option key={c.id} value={c.id}>
-                  #{c.id} — {c.bale_user_id} {c.display_name ? `(${c.display_name})` : ''}
+                  #{c.id} — [{(c.provider_type || 'bale').toUpperCase()}] {c.external_id || c.bale_user_id} {c.display_name ? `(${c.display_name})` : ''}
                 </Select.Option>
               ))}
             </Select>
@@ -276,7 +286,7 @@ export function PairingsPage() {
             <Select placeholder="Select server...">
               {availableServers.map((s: any) => (
                 <Select.Option key={s.id} value={s.id}>
-                  #{s.id} — {s.bale_user_id} {s.display_name ? `(${s.display_name})` : ''}
+                  #{s.id} — [{(s.provider_type || 'bale').toUpperCase()}] {s.external_id || s.bale_user_id} {s.display_name ? `(${s.display_name})` : ''}
                   {pairedServerIDs.has(s.id) ? ' ✓ (your pairing)' : ''}
                 </Select.Option>
               ))}

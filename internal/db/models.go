@@ -13,7 +13,7 @@ import (
 type Account struct {
 	ID           uint           `gorm:"primarykey" json:"id"`
 	ProviderType string         `gorm:"type:text;not null;default:'bale';index:idx_provider_ext,unique" json:"provider_type"` // bale, soroush
-	ExternalID   int64          `gorm:"not null;index:idx_provider_ext,unique" json:"external_id"`
+	ExternalID   int64          `gorm:"not null;default:0;index:idx_provider_ext,unique" json:"external_id"`
 	BaleUserID   int64          `gorm:"index" json:"bale_user_id"` // Deprecated in favor of ExternalID
 	AccessHash   int64          `json:"access_hash"`
 	Token        string         `gorm:"default:''" json:"-"` // never expose token in JSON (only for Bale)

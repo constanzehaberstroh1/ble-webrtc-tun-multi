@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Card, Table, Button, Modal, Form, Input, Tag, Space, Typography, Popconfirm, message, Steps, Alert } from 'antd';
+import { Card, Table, Button, Modal, Form, Input, Tag, Space, Typography, Popconfirm, message, Steps, Alert, Radio } from 'antd';
 import { PlusOutlined, DeleteOutlined, UserOutlined, MobileOutlined, SafetyOutlined, ProfileOutlined, CloudUploadOutlined, PhoneOutlined } from '@ant-design/icons';
 import { api } from '../../api';
 import { AccountDetailsDrawer } from '../organisms';
@@ -23,6 +23,7 @@ export function AccountsPage() {
   const [otpCode, setOtpCode] = useState('');
   const [otpLoading, setOtpLoading] = useState(false);
   const [otpMessage, setOtpMessage] = useState('');
+  const [providerVal, setProviderVal] = useState<'bale' | 'soroush'>('bale');
 
   const load = useCallback(async () => {
     try {
@@ -128,7 +129,7 @@ export function AccountsPage() {
     setOtpLoading(true);
     setOtpMessage('');
     try {
-      const res = await api.baleLoginStart(otpPhone);
+      const res = await api.baleLoginStart(otpPhone, providerVal);
       setOtpMessage(res.message || 'OTP sent!');
       setOtpStep(1);
       message.success('OTP code sent to ' + otpPhone);
@@ -148,7 +149,7 @@ export function AccountsPage() {
     setOtpMessage('');
     try {
       // Role is auto-determined by backend — no need to specify
-      const res = await api.baleLoginVerify(otpPhone, otpCode);
+      const res = await api.baleLoginVerify(otpPhone, otpCode, providerVal);
       message.success(`Account ${res.updated ? 'updated' : 'created'}: ${res.phone || res.name || res.user_id}`);
       setShowOTP(false);
       resetOTP();
@@ -166,6 +167,7 @@ export function AccountsPage() {
     setOtpPhone('');
     setOtpCode('');
     setOtpMessage('');
+    setProviderVal('bale');
   };
 
   const timeAgo = (ts: string) => {
@@ -203,10 +205,23 @@ export function AccountsPage() {
       render: (text: string) => <Text strong>{text}</Text>,
     },
     {
-      title: 'Bale ID',
-      dataIndex: 'bale_user_id',
-      key: 'bale_user_id',
-      render: (text: string) => <Tag color="cyan" className="font-mono">{text}</Tag>,
+      title: 'Provider',
+      dataIndex: 'provider_type',
+      key: 'provider_type',
+      render: (prov: string) => {
+        const val = prov || 'bale';
+        const color = val === 'soroush' ? 'orange' : 'green';
+        return <Tag color={color} style={{ textTransform: 'uppercase', fontWeight: 'bold' }}>{val}</Tag>;
+      },
+    },
+    {
+      title: 'External ID',
+      dataIndex: 'external_id',
+      key: 'external_id',
+      render: (text: string, r: any) => {
+        const val = text || r.bale_user_id;
+        return <Tag color="cyan" className="font-mono">{val}</Tag>;
+      },
     },
     {
       title: 'Role',
@@ -358,7 +373,7 @@ export function AccountsPage() {
         title={
           <Space>
             <MobileOutlined style={{ color: '#667eea' }} />
-            <span>Add Bale Account via OTP</span>
+            <span>Add Account via OTP</span>
             {panelRole && <Tag color={panelRole === 'CLIENT' ? 'purple' : 'blue'}>{panelRole}</Tag>}
           </Space>
         }
@@ -389,6 +404,19 @@ export function AccountsPage() {
         {otpStep === 0 && (
           <div className="space-y-4">
             <div>
+              <label className="block text-sm font-medium mb-1">Select Provider</label>
+              <Radio.Group
+                value={providerVal}
+                onChange={e => setProviderVal(e.target.value)}
+                className="mb-4 w-full flex"
+                buttonStyle="solid"
+              >
+                <Radio.Button value="bale" className="flex-1 text-center" style={{ fontWeight: 'bold' }}>Bale</Radio.Button>
+                <Radio.Button value="soroush" className="flex-1 text-center" style={{ fontWeight: 'bold' }}>Soroush</Radio.Button>
+              </Radio.Group>
+            </div>
+
+            <div>
               <label className="block text-sm font-medium mb-1">Phone Number</label>
               <Input
                 size="large"
@@ -399,7 +427,7 @@ export function AccountsPage() {
                 onPressEnter={handleOTPStart}
               />
               <Text type="secondary" className="text-xs mt-1 block">
-                Enter the Bale account phone number (Iranian format)
+                Enter the account phone number (Iranian format)
               </Text>
             </div>
             {panelRole && (

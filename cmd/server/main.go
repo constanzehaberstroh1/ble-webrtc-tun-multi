@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -15,16 +16,20 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
+	"github.com/quic-go/quic-go"
+	"github.com/pion/webrtc/v4"
 	"github.com/salman/ble-webrtc-tun/internal/accounts"
 	"github.com/salman/ble-webrtc-tun/internal/admin"
 	"github.com/salman/ble-webrtc-tun/internal/api"
-	"github.com/salman/ble-webrtc-tun/internal/bale"
 	"github.com/salman/ble-webrtc-tun/internal/config"
 	"github.com/salman/ble-webrtc-tun/internal/db"
 	"github.com/salman/ble-webrtc-tun/internal/dcconn"
 	"github.com/salman/ble-webrtc-tun/internal/livekit"
 	"github.com/salman/ble-webrtc-tun/internal/logger"
+	"github.com/salman/ble-webrtc-tun/internal/provider"
+	"github.com/salman/ble-webrtc-tun/internal/quicconn"
 	"github.com/salman/ble-webrtc-tun/internal/router"
+	"github.com/salman/ble-webrtc-tun/internal/soroush"
 	"github.com/salman/ble-webrtc-tun/internal/transport"
 )
 
@@ -132,17 +137,19 @@ func main() {
 		adminPanel.AddLog("info", "Proxy mode — userspace IP relay")
 	}
 
-	// Create obfuscator for anti-DPI payload encryption
+	// Obfuscation: XChaCha20-Poly1305 over RTP payloads.
+	// With QUIC (TLS 1.3) + WebRTC (DTLS/SRTP) the data is already triple-encrypted.
+	// Leave OBFUSCATION_SECRET empty for maximum speed — 40 bytes/pkt saved + less CPU.
 	if cfg.ObfuscationSecret != "" {
 		var err error
 		serverObf, err = dcconn.NewObfuscator(cfg.ObfuscationSecret)
 		if err != nil {
 			mainLog.Error("Failed to create obfuscator: %v (running without obfuscation)", err)
 		} else {
-			mainLog.Info("ChaCha20-Poly1305 obfuscation enabled (overhead: %d bytes/msg)", serverObf.Overhead())
+			mainLog.Warn("⚠️  XChaCha20 obfuscation ENABLED — REDUNDANT with QUIC+SRTP. Costs 40 bytes/pkt + CPU. Unset OBFUSCATION_SECRET for max speed.")
 		}
 	} else {
-		mainLog.Warn("No OBFUSCATION_SECRET set — traffic is not obfuscated (DPI visible)")
+		mainLog.Info("✅ Obfuscation disabled — QUIC TLS 1.3 + DTLS/SRTP provides full encryption. Full MTU available.")
 	}
 
 	// Bale signaling mode: connect to Bale WS, auto-accept calls
@@ -269,7 +276,14 @@ func runSingleAccountLoop(ctx context.Context, cfg *config.Config, adminPanel *a
 		}
 
 		adminPanel.AddLog("info", label+" Connecting to Bale WS...")
-		client := bale.NewClient(token)
+		factory, _ := provider.GetFactory(provider.ProviderBale)
+		client, err := factory.NewClient(map[string]interface{}{"token": token})
+		if err != nil {
+			adminPanel.AddLog("error", label+" Client init failed: "+err.Error())
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
 		if err := client.Connect(); err != nil {
 			adminPanel.AddLog("error", label+" Bale connect failed: "+err.Error())
 			mainLog.Error("%s Connect failed: %v, retrying in 10s", label, err)
@@ -315,17 +329,44 @@ func runSingleAccountLoopDB(ctx context.Context, cfg *config.Config, adminPanel 
 		default:
 		}
 
-		adminPanel.AddLog("info", label+" Connecting to Bale WS...")
-		client := bale.NewClient(account.Token)
+		clientProv := account.ProviderType
+		if clientProv == "" {
+			clientProv = "bale"
+		}
+		adminPanel.AddLog("info", label+" Connecting to "+clientProv+" WS...")
+
+		factory, ok := provider.GetFactory(provider.ProviderType(clientProv))
+		if !ok {
+			adminPanel.AddLog("error", label+" No factory for "+clientProv)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		acctData := map[string]interface{}{
+			"token":       account.Token,
+			"external_id": account.ExternalID,
+			"access_hash": account.AccessHash,
+			"auth_key":    account.AuthKey,
+			"auth_key_id": account.AuthKeyID,
+			"server_salt": account.ServerSalt,
+		}
+
+		client, err := factory.NewClient(acctData)
+		if err != nil {
+			adminPanel.AddLog("error", label+" Client init failed: "+err.Error())
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
 		if err := client.Connect(); err != nil {
-			adminPanel.AddLog("error", label+" Bale connect failed: "+err.Error())
+			adminPanel.AddLog("error", label+" "+clientProv+" connect failed: "+err.Error())
 			serverDB.SetAccountError(account.ID, "connect: "+err.Error())
 			mainLog.Error("%s Connect failed: %v, retrying in 10s", label, err)
 			time.Sleep(10 * time.Second)
 			continue
 		}
 
-		adminPanel.AddLog("info", label+" Bale WS connected!")
+		adminPanel.AddLog("info", label+" "+clientProv+" WS connected!")
 		serverDB.SetAccountStatus(account.ID, db.StatusIdle)
 		serverDB.TouchAccount(account.ID)
 		adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
@@ -365,7 +406,7 @@ var (
 
 // runSessionLoop handles incoming calls on a single Bale client connection (legacy mode).
 // expectedCallerID filters calls: only accept from the paired client user.
-func runSessionLoop(ctx context.Context, cfg *config.Config, adminPanel *admin.Server, _ *transport.WebRTCTransport, client *bale.Client, expectedCallerID int64, useTUN bool) {
+func runSessionLoop(ctx context.Context, cfg *config.Config, adminPanel *admin.Server, _ *transport.WebRTCTransport, client provider.Client, expectedCallerID int64, useTUN bool) {
 	callCh := client.GetCallCh()
 	sessionNum := 0
 
@@ -374,7 +415,7 @@ func runSessionLoop(ctx context.Context, cfg *config.Config, adminPanel *admin.S
 		adminPanel.AddLog("info", "👂 Waiting for incoming call...")
 		mainLog.Info(" Ready — waiting for call")
 
-		var call *bale.IncomingCall
+		var call *provider.IncomingCall
 		select {
 		case <-ctx.Done():
 			return
@@ -498,7 +539,7 @@ func runSessionLoop(ctx context.Context, cfg *config.Config, adminPanel *admin.S
 
 // runSessionLoopDB handles incoming calls using the DB-driven router for validation.
 // Also handles terminal relay messages (BLECMD/BLERSZ/BLEEND) while waiting for calls.
-func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin.Server, _ *transport.WebRTCTransport, client *bale.Client, account db.Account, expectedCallerID int64, label string, useTUN bool) {
+func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin.Server, _ *transport.WebRTCTransport, client provider.Client, account db.Account, expectedCallerID int64, label string, useTUN bool) {
 	callCh := client.GetCallCh()
 	sessionNum := 0
 
@@ -507,7 +548,7 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 		drainDone := false
 		for !drainDone {
 			select {
-			case msg := <-client.TextMsgCh:
+			case msg := <-client.GetTextMsgCh():
 				// Process terminal messages, drop stale tunnel messages
 				if strings.HasPrefix(msg, "BLECMD:") || strings.HasPrefix(msg, "BLERSZ:") || strings.HasPrefix(msg, "BLEEND:") {
 					// Terminal relay removed — commands now go via VPN proxy
@@ -531,7 +572,7 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 		adminPanel.AddLog("info", label+" 👂 Waiting for incoming call...")
 		mainLog.Info("%s Ready — waiting for call", label)
 
-		var call *bale.IncomingCall
+		var call *provider.IncomingCall
 		for {
 			select {
 			case <-ctx.Done():
@@ -542,7 +583,7 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 					return
 				}
 				call = c
-			case msg := <-client.TextMsgCh:
+			case msg := <-client.GetTextMsgCh():
 				// Handle terminal relay messages while waiting for calls
 				if strings.HasPrefix(msg, "BLECMD:") || strings.HasPrefix(msg, "BLERSZ:") || strings.HasPrefix(msg, "BLEEND:") {
 					// Terminal relay removed — commands now go via VPN proxy
@@ -593,84 +634,337 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 			continue
 		}
 
-		adminPanel.AddLog("info", tag+" ✅ LiveKit token! Room="+result.RoomID)
-		mainLog.Info("%s LiveKit: room=%s wss=%s", tag, result.RoomID, result.WssURL)
+		if account.ProviderType == "soroush" {
+			// Soroush WebRTC P2P connection logic (Server/Answerer side)!
+			mainLog.Info("%s ✅ Call accepted! Initializing Soroush P2P WebRTC Answerer...", tag)
+			adminPanel.AddLog("info", tag+" P2P Call accepted. Negotiating WebRTC Answerer...")
 
-		// Confirm call in router (RESERVED → IN_CALL)
-		session, routerErr := callRouter.ConfirmCall(account.ID, call.CallID, result.RoomID)
-		if routerErr != nil {
-			mainLog.Info("%s Router confirm failed: %v", tag, routerErr)
-		}
+			iceServers := make([]webrtc.ICEServer, 0)
+			for _, conn := range result.Connections {
+				ice := webrtc.ICEServer{URLs: []string{conn.URL}}
+				if conn.Username != "" {
+					ice.Username = conn.Username
+					ice.Credential = conn.Password
+					ice.CredentialType = webrtc.ICECredentialTypePassword
+				}
+				iceServers = append(iceServers, ice)
+			}
 
-		wssURL := result.WssURL
-		if len(wssURL) > 0 && wssURL[len(wssURL)-1] == '(' {
-			wssURL = wssURL[:len(wssURL)-1]
-		}
+			config := webrtc.Configuration{
+				ICEServers:    iceServers,
+				BundlePolicy:  webrtc.BundlePolicyMaxBundle,
+				RTCPMuxPolicy: webrtc.RTCPMuxPolicyRequire,
+			}
 
-		sessionCfg := *cfg
-		sessionCfg.LiveKitWSURL = wssURL + "/rtc"
-		sessionCfg.LiveKitToken = result.LivekitToken
+			pc, err := webrtc.NewPeerConnection(config)
+			if err != nil {
+				adminPanel.AddLog("error", tag+" Failed to create PeerConnection: "+err.Error())
+				client.DiscardCall(call.CallID)
+				serverDB.SetAccountStatus(account.ID, db.StatusIdle)
+				continue
+			}
 
-		adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
-			s.LiveKitJoined = true
-			s.RoomID = result.RoomID
-			s.CallID = itoa64(call.CallID)
-			s.TotalSessions++
-			s.ActiveChannels++
-			s.ConnectedSince = time.Now().Format("15:04:05")
-		})
+			// Dummy Opus track for call camouflage
+			audioTrack, err := webrtc.NewTrackLocalStaticSample(
+				webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+				"audio0",
+				"soroush-voice-stream",
+			)
+			if err != nil {
+				pc.Close()
+				client.DiscardCall(call.CallID)
+				serverDB.SetAccountStatus(account.ID, db.StatusIdle)
+				adminPanel.AddLog("error", tag+" Failed to create audio track: "+err.Error())
+				continue
+			}
 
-		sessionCtx, sessionCancel := context.WithCancel(ctx)
-		mainLog.Info("%s Connecting to LiveKit SFU...", tag)
+			_, err = pc.AddTrack(audioTrack)
+			if err != nil {
+				pc.Close()
+				client.DiscardCall(call.CallID)
+				serverDB.SetAccountStatus(account.ID, db.StatusIdle)
+				adminPanel.AddLog("error", tag+" Failed to add audio track: "+err.Error())
+				continue
+			}
 
-		sfuTransport := livekit.NewSFUTransport(&sessionCfg, serverObf)
-		if err := sfuTransport.Connect(sessionCtx); err != nil {
-			adminPanel.AddLog("error", tag+" SFU connect failed: "+err.Error())
-			mainLog.Error("%s SFU connect failed: %v", tag, err)
-			sessionCancel()
-			client.DiscardCall(call.CallID)
-			sfuTransport.Close()
-			callRouter.EndCallWithError(account.ID, 0, 0, "SFU connect: "+err.Error())
-			continue
-		}
-		adminPanel.AddLog("info", tag+" ✅ SFU connected!")
-
-		// Run tunnel session in goroutine
-		go func(sctx context.Context, scancel context.CancelFunc, sfu *livekit.SFUTransport, sTag string, cID int64, sNum int, sess *router.Session) {
-			defer scancel()
-			defer sfu.Close()
-
-			handleSFUProxy(sctx, cfg, sfu, adminPanel, client, sTag, expectedCallerID)
-
-			mainLog.Info("%s Tunnel ended — cleaning up", sTag)
-			adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
-				s.TunnelActive = false
-				s.LiveKitJoined = false
-				s.ConnectedSince = ""
-				if s.ActiveChannels > 0 {
-					s.ActiveChannels--
+			pendingICE := make(chan string, 64)
+			pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+				if c == nil {
+					return
+				}
+				select {
+				case pendingICE <- c.ToJSON().Candidate:
+				default:
 				}
 			})
-			client.DiscardCall(cID)
 
-			// End call in router (IN_CALL → IDLE) with stats
-			stats := sfu.GetStats()
-			bytesSent, _ := stats["bytes_sent"].(int64)
-			bytesRecv, _ := stats["bytes_received"].(int64)
-			callRouter.EndCall(account.ID, bytesSent, bytesRecv, "SESSION_END")
+			var dc *webrtc.DataChannel
+			dcOpenCh := make(chan struct{})
+			pc.OnDataChannel(func(d *webrtc.DataChannel) {
+				dc = d
+				dc.OnOpen(func() {
+					close(dcOpenCh)
+				})
+			})
 
-			client.CleanupMessages()
-			mainLog.Info("%s ✅ Cleanup done", sTag)
-		}(sessionCtx, sessionCancel, sfuTransport, tag, call.CallID, sessionNum, session)
+			// Message listener loop for SDP Offer + Client ICE candidates
+			sdpCtx, sdpCancel := context.WithCancel(ctx)
+			sdpDone := make(chan bool, 1)
 
-		time.Sleep(1 * time.Second)
+			go func() {
+				for {
+					select {
+					case <-sdpCtx.Done():
+						return
+					case text := <-client.GetTextMsgCh():
+						if soroush.IsSDPOffer(text) {
+							sdpStr := soroush.ExtractSDP(text)
+							mainLog.Info("[%s] Received SDP offer (%d bytes)", tag, len(sdpStr))
+
+							offer := webrtc.SessionDescription{
+								Type: webrtc.SDPTypeOffer,
+								SDP:  sdpStr,
+							}
+							if err := pc.SetRemoteDescription(offer); err != nil {
+								mainLog.Error("[%s] SetRemoteDescription failed: %v", tag, err)
+								return
+							}
+
+							answer, err := pc.CreateAnswer(nil)
+							if err != nil {
+								mainLog.Error("[%s] CreateAnswer failed: %v", tag, err)
+								return
+							}
+
+							if err := pc.SetLocalDescription(answer); err != nil {
+								mainLog.Error("[%s] SetLocalDescription failed: %v", tag, err)
+								return
+							}
+
+							// Send SDP Answer back
+							answerMsg := soroush.FormatSDPAnswer(answer.SDP)
+							client.SendTextMessage(call.CallerID, answerMsg)
+							mainLog.Info("[%s] Sent SDP answer", tag)
+
+							// Send buffered ICE candidates
+							go func() {
+								for {
+									select {
+									case candidate := <-pendingICE:
+										iceMsg := soroush.FormatICECandidate(candidate)
+										client.SendTextMessage(call.CallerID, iceMsg)
+									case <-sdpCtx.Done():
+										return
+									}
+								}
+							}()
+
+							select {
+							case sdpDone <- true:
+							default:
+							}
+						}
+
+						if soroush.IsICECandidate(text) {
+							candidateStr := soroush.ExtractICECandidate(text)
+							if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidateStr}); err != nil {
+								mainLog.Warn("[%s] AddICECandidate failed: %v", tag, err)
+							}
+						}
+					}
+				}
+			}()
+
+			// Confirm call in router (RESERVED → IN_CALL)
+			session, routerErr := callRouter.ConfirmCall(account.ID, call.CallID, fmt.Sprintf("soroush-room-%d", call.CallID))
+			if routerErr != nil {
+				mainLog.Info("%s Router confirm failed: %v", tag, routerErr)
+			}
+
+			adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
+				s.LiveKitJoined = true
+				s.RoomID = fmt.Sprintf("soroush-room-%d", call.CallID)
+				s.CallID = itoa64(call.CallID)
+				s.TotalSessions++
+				s.ActiveChannels++
+				s.ConnectedSince = time.Now().Format("15:04:05")
+			})
+
+			sessionCtx, sessionCancel := context.WithCancel(ctx)
+
+			go func(sctx context.Context, scancel context.CancelFunc, pconn *webrtc.PeerConnection, sTag string, cID int64, sNum int, sess *router.Session) {
+				defer scancel()
+				defer sdpCancel()
+				defer pconn.Close()
+				defer func() {
+					mainLog.Info("%s Tunnel ended — cleaning up", sTag)
+					adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
+						s.TunnelActive = false
+						s.LiveKitJoined = false
+						s.ConnectedSince = ""
+						if s.ActiveChannels > 0 {
+							s.ActiveChannels--
+						}
+					})
+					client.DiscardCall(cID)
+
+					// End call in router (IN_CALL → IDLE) with stats
+					callRouter.EndCall(account.ID, 0, 0, "SESSION_END")
+
+					client.CleanupMessages()
+					mainLog.Info("%s ✅ Cleanup done", sTag)
+				}()
+
+				// Wait for SDP Offer negotiation
+				select {
+				case <-sdpDone:
+				case <-time.After(30 * time.Second):
+					mainLog.Error("%s SDP Offer timeout (30s)", sTag)
+					adminPanel.AddLog("error", sTag+" SDP Offer timeout")
+					return
+				case <-sctx.Done():
+					return
+				}
+
+				// Wait for data channel open
+				select {
+				case <-dcOpenCh:
+				case <-time.After(15 * time.Second):
+					mainLog.Error("%s Data Channel open timeout (15s)", sTag)
+					adminPanel.AddLog("error", sTag+" Data Channel open timeout")
+					return
+				case <-sctx.Done():
+					return
+				}
+
+				adminPanel.AddLog("info", sTag+" Tunnel established via Soroush P2P!")
+				adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
+					s.TunnelActive = true
+				})
+
+				// Setup yamux server session
+				dcConn := soroush.NewDataChannelConn(dc)
+				ymuxCfg := yamux.DefaultConfig()
+				ymuxCfg.EnableKeepAlive = true
+				ymuxCfg.KeepAliveInterval = 15 * time.Second
+				ymuxCfg.ConnectionWriteTimeout = 60 * time.Second
+				ymuxCfg.StreamCloseTimeout = 120 * time.Second
+				ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024
+				ymuxCfg.AcceptBacklog = 1024
+				ymuxCfg.LogOutput = io.Discard
+
+				ymuxSess, err := yamux.Server(dcConn, ymuxCfg)
+				if err != nil {
+					adminPanel.AddLog("error", sTag+" Yamux server: "+err.Error())
+					return
+				}
+				defer ymuxSess.Close()
+
+				mainLog.Info("%s Yamux proxy active (Soroush P2P)", sTag)
+				go handleYamuxSession(ymuxSess)
+
+				// Monitor session termination
+				for {
+					select {
+					case <-sctx.Done():
+						return
+					case msg := <-client.GetTextMsgCh():
+						if msg == "BLETUN:END" {
+							adminPanel.AddLog("info", sTag+" Client sent END")
+							mainLog.Info("%s Client sent BLETUN:END", sTag)
+							return
+						}
+						if msg == "BLETUN:ENDCALL" {
+							mainLog.Info("%s 📴 Received ENDCALL command — ending active call", sTag)
+							adminPanel.AddLog("info", sTag+" 📴 ENDCALL received — ending call and sending ACK")
+							client.SendTextMessage(call.CallerID, "BLETUN:ENDCALL_ACK")
+							return
+						}
+					}
+				}
+			}(sessionCtx, sessionCancel, pc, tag, call.CallID, sessionNum, session)
+
+			time.Sleep(1 * time.Second)
+
+		} else {
+			adminPanel.AddLog("info", tag+" ✅ LiveKit token! Room="+result.RoomID)
+			mainLog.Info("%s LiveKit: room=%s wss=%s", tag, result.RoomID, result.WssURL)
+
+			// Confirm call in router (RESERVED → IN_CALL)
+			session, routerErr := callRouter.ConfirmCall(account.ID, call.CallID, result.RoomID)
+			if routerErr != nil {
+				mainLog.Info("%s Router confirm failed: %v", tag, routerErr)
+			}
+
+			wssURL := result.WssURL
+			if len(wssURL) > 0 && wssURL[len(wssURL)-1] == '(' {
+				wssURL = wssURL[:len(wssURL)-1]
+			}
+
+			sessionCfg := *cfg
+			sessionCfg.LiveKitWSURL = wssURL + "/rtc"
+			sessionCfg.LiveKitToken = result.LivekitToken
+
+			adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
+				s.LiveKitJoined = true
+				s.RoomID = result.RoomID
+				s.CallID = itoa64(call.CallID)
+				s.TotalSessions++
+				s.ActiveChannels++
+				s.ConnectedSince = time.Now().Format("15:04:05")
+			})
+
+			sessionCtx, sessionCancel := context.WithCancel(ctx)
+			mainLog.Info("%s Connecting to LiveKit SFU...", tag)
+
+			sfuTransport := livekit.NewSFUTransport(&sessionCfg, serverObf)
+			if err := sfuTransport.Connect(sessionCtx); err != nil {
+				adminPanel.AddLog("error", tag+" SFU connect failed: "+err.Error())
+				mainLog.Error("%s SFU connect failed: %v", tag, err)
+				sessionCancel()
+				client.DiscardCall(call.CallID)
+				sfuTransport.Close()
+				callRouter.EndCallWithError(account.ID, 0, 0, "SFU connect: "+err.Error())
+				continue
+			}
+			adminPanel.AddLog("info", tag+" ✅ SFU connected!")
+
+			// Run tunnel session in goroutine
+			go func(sctx context.Context, scancel context.CancelFunc, sfu *livekit.SFUTransport, sTag string, cID int64, sNum int, sess *router.Session) {
+				defer scancel()
+				defer sfu.Close()
+
+				handleSFUProxy(sctx, cfg, sfu, adminPanel, client, sTag, expectedCallerID)
+
+				mainLog.Info("%s Tunnel ended — cleaning up", sTag)
+				adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
+					s.TunnelActive = false
+					s.LiveKitJoined = false
+					s.ConnectedSince = ""
+					if s.ActiveChannels > 0 {
+						s.ActiveChannels--
+					}
+				})
+				client.DiscardCall(cID)
+
+				// End call in router (IN_CALL → IDLE) with stats
+				stats := sfu.GetStats()
+				bytesSent, _ := stats["bytes_sent"].(int64)
+				bytesRecv, _ := stats["bytes_received"].(int64)
+				callRouter.EndCall(account.ID, bytesSent, bytesRecv, "SESSION_END")
+
+				client.CleanupMessages()
+				mainLog.Info("%s ✅ Cleanup done", sTag)
+			}(sessionCtx, sessionCancel, sfuTransport, tag, call.CallID, sessionNum, session)
+
+			time.Sleep(1 * time.Second)
+		}
 	}
 }
 
 
-func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTransport, adminPanel *admin.Server, baleClient *bale.Client, tag string, callerID int64) {
-	// Wait for remote track (client's video through SFU)
-	adminPanel.AddLog("info", tag+" Waiting for client's video track via SFU (30s)...")
+func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTransport, adminPanel *admin.Server, baleClient provider.Client, tag string, callerID int64) {
+	adminPanel.AddLog("info", tag+" Waiting for client track via SFU (30s)...")
 	mainLog.Info("%s Waiting for remote track...", tag)
 
 	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -681,118 +975,159 @@ func handleSFUProxy(ctx context.Context, cfg *config.Config, sfu *livekit.SFUTra
 	}
 
 	adminPanel.AddLog("info", tag+" Tunnel established via SFU!")
-	adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
-		s.TunnelActive = true
-	})
+	adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) { s.TunnelActive = true })
 
-	// Setup yamux server session over DataChannel
-	dc := sfu.DataConn()
-	if dc == nil {
-		adminPanel.AddLog("error", tag+" DataConn not ready")
+	// Setup QUIC server over the Opus RTP track
+	rtpConn := sfu.GetRTPConn()
+	if rtpConn == nil {
+		adminPanel.AddLog("error", tag+" RTP connection not ready")
 		return
 	}
 
-	ymuxCfg := yamux.DefaultConfig()
-	ymuxCfg.EnableKeepAlive = true                      // Ping peer to detect dead connections
-	ymuxCfg.KeepAliveInterval = 15 * time.Second        // Faster dead detection (match client)
-	ymuxCfg.ConnectionWriteTimeout = 60 * time.Second   // Tolerant of KCP retransmission (match client)
-	ymuxCfg.StreamCloseTimeout = 120 * time.Second
-	ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024      // 16MB — must match client (was 1MB)
-	ymuxCfg.AcceptBacklog = 1024                         // Handle many parallel connections
-	ymuxCfg.LogOutput = io.Discard                      // Silence yamux internal logs
-
-	session, err := yamux.Server(dc, ymuxCfg)
+	opusPC := quicconn.NewServer(rtpConn)
+	tlsCfg, err := quicconn.ServerTLSConfig()
 	if err != nil {
-		adminPanel.AddLog("error", tag+" Yamux server: "+err.Error())
+		adminPanel.AddLog("error", tag+" TLS config error: "+err.Error())
 		return
 	}
-	defer session.Close()
 
-	mainLog.Info("%s Yamux proxy active", tag)
-	go handleYamuxSession(session)
+	initPktSize := uint16(1140)
+	if serverObf != nil && serverObf.Enabled() {
+		initPktSize = 1100
+	}
+	quicCfg := &quic.Config{
+		InitialPacketSize:               initPktSize,
+		MaxIdleTimeout:                  30 * time.Second,
+		KeepAlivePeriod:                 5 * time.Second,
+		MaxIncomingStreams:              10000,
+		MaxIncomingUniStreams:           10000,
+		InitialStreamReceiveWindow:      2 * 1024 * 1024,
+		MaxStreamReceiveWindow:          16 * 1024 * 1024,
+		InitialConnectionReceiveWindow:  4 * 1024 * 1024,
+		MaxConnectionReceiveWindow:      16 * 1024 * 1024,
+		DisablePathMTUDiscovery:         true,
+	}
 
-	// Monitor
-	// Drain stale text messages (BLETUN:END from previous --disconnect runs)
-	// These get buffered in Bale chat and would immediately kill the new session
+	listener, err := quic.Listen(opusPC, tlsCfg, quicCfg)
+	if err != nil {
+		adminPanel.AddLog("error", tag+" QUIC listen failed: "+err.Error())
+		return
+	}
+	defer listener.Close()
+	mainLog.Info("%s QUIC listener ready", tag)
+
+	accCtx, accCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer accCancel()
+	qconn, err := listener.Accept(accCtx)
+	if err != nil {
+		adminPanel.AddLog("error", tag+" QUIC accept timeout: "+err.Error())
+		return
+	}
+	mainLog.Info("%s QUIC client connected — proxy active", tag)
+	adminPanel.AddLog("info", tag+" ✅ QUIC tunnel established!")
+	adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) { s.TunnelActive = true })
+
+	go handleQUICConn(ctx, qconn)
+
+	// Monitor: drain stale text messages + watch for END/ENDCALL signals
 drainLoop:
 	for {
 		select {
-		case msg := <-baleClient.TextMsgCh:
+		case msg := <-baleClient.GetTextMsgCh():
 			mainLog.Info("%s Drained stale text message: %s", tag, msg)
 		default:
 			break drainLoop
 		}
 	}
 
-	// Grace period: ignore BLETUN:END for 10s after session start.
-	// Bale replays unread messages from chat history which may include
-	// old END messages from previous --disconnect runs.
 	sessionStart := time.Now()
 	gracePeriod := 10 * time.Second
-
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			mainLog.Info("%s Context cancelled", tag)
 			return
-		case msg := <-baleClient.TextMsgCh:
+		case <-qconn.Context().Done():
+			mainLog.Info("%s QUIC connection closed", tag)
+			return
+		case msg := <-baleClient.GetTextMsgCh():
 			if msg == "BLETUN:END" {
 				if time.Since(sessionStart) < gracePeriod {
-					mainLog.Info("%s Ignoring stale BLETUN:END (within %v grace period)", tag, gracePeriod)
+					mainLog.Info("%s Ignoring stale BLETUN:END (grace period)", tag)
 					continue
 				}
 				adminPanel.AddLog("info", tag+" Client sent END")
-				mainLog.Info("%s Client sent BLETUN:END", tag)
 				return
 			}
-			// Handle ENDCALL command — client requests server to end active call
-			// Send ACK immediately, then return to trigger the goroutine's cleanup
-			// (DiscardCall + router EndCall + CleanupMessages) which properly ends
-			// the Bale call and updates the server UI/router state.
 			if msg == "BLETUN:ENDCALL" {
-				mainLog.Info("%s 📴 Received ENDCALL command — ending active call", tag)
-				adminPanel.AddLog("info", tag+" 📴 ENDCALL received — ending call and sending ACK")
-				// Send acknowledgment to the client BEFORE returning
+				mainLog.Info("%s ENDCALL received", tag)
 				if callerID != 0 {
 					baleClient.SendTextMessage(callerID, "BLETUN:ENDCALL_ACK")
 				}
-				// Don't call CleanupMessages here — the goroutine cleanup after
-				// handleSFUProxy returns will handle DiscardCall (ends Bale call),
-				// callRouter.EndCall (updates server UI/router), and CleanupMessages.
 				return
-			}
-			// Handle terminal relay messages (BLECMD, BLERSZ, BLEEND)
-			if strings.HasPrefix(msg, "BLECMD:") || strings.HasPrefix(msg, "BLERSZ:") || strings.HasPrefix(msg, "BLEEND:") {
-				// Terminal relay removed — commands now go via VPN proxy
-				continue
 			}
 		case <-ticker.C:
-			if session.IsClosed() {
-				adminPanel.AddLog("warn", tag+" Yamux session closed")
-				mainLog.Info("%s Yamux session closed", tag)
-				return
-			}
 			stats := sfu.GetStats()
 			bytesSent, _ := stats["bytes_sent"].(int64)
 			bytesRecv, _ := stats["bytes_received"].(int64)
 			adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
-				// Compute speed (delta over 5s interval)
 				s.SpeedUp = (bytesSent - s.PrevBytesSent) / 5
 				s.SpeedDown = (bytesRecv - s.PrevBytesRecv) / 5
 				s.PrevBytesSent = bytesSent
 				s.PrevBytesRecv = bytesRecv
 				s.BytesSent = bytesSent
 				s.BytesReceived = bytesRecv
-				s.ActiveConns = session.NumStreams()
 			})
 		}
 	}
 }
 
+// handleQUICConn accepts streams from one QUIC connection and proxies each to the internet.
+func handleQUICConn(ctx context.Context, qconn quic.Connection) {
+	for {
+		stream, err := qconn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		go handleQUICStream(stream, qconn)
+	}
+}
+
+// handleQUICStream proxies one QUIC stream to the target address sent by the client.
+func handleQUICStream(stream quic.Stream, conn quic.Connection) {
+	defer stream.Close()
+
+	// Read 2-byte length-prefixed target address
+	var addrLen [2]byte
+	if _, err := io.ReadFull(stream, addrLen[:]); err != nil {
+		return
+	}
+	l := int(addrLen[0])<<8 | int(addrLen[1])
+	if l == 0 || l > 512 {
+		return
+	}
+	addr := make([]byte, l)
+	if _, err := io.ReadFull(stream, addr); err != nil {
+		return
+	}
+
+	target, err := net.Dial("tcp", string(addr))
+	if err != nil {
+		return
+	}
+	defer target.Close()
+
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(target, stream); done <- struct{}{} }()
+	go func() { io.Copy(stream, target); done <- struct{}{} }()
+	<-done
+}
+
 // handleBaleProxy handles one tunnel session: SDP exchange → WebRTC → proxy traffic.
-func handleBaleProxy(ctx context.Context, cfg *config.Config, lkClient *livekit.SignalClient, adminPanel *admin.Server, baleClient *bale.Client, callerID int64, sessionNum int) {
+func handleBaleProxy(ctx context.Context, cfg *config.Config, lkClient *livekit.SignalClient, adminPanel *admin.Server, baleClient provider.Client, callerID int64, sessionNum int) {
 	tag := fmt.Sprintf("[Session #%d]", sessionNum)
 	adminPanel.AddLog("info", fmt.Sprintf("%s ⏳ Waiting for client SDP offer...", tag))
 	mainLog.Info("%s Waiting for SDP offer via Bale", tag)
@@ -802,7 +1137,7 @@ func handleBaleProxy(ctx context.Context, cfg *config.Config, lkClient *livekit.
 	timeout := time.After(300 * time.Second)
 	for {
 		select {
-		case msg := <-baleClient.TextMsgCh:
+		case msg := <-baleClient.GetTextMsgCh():
 			if strings.HasPrefix(msg, "BLETUN:O:") {
 				encoded := strings.TrimPrefix(msg, "BLETUN:O:")
 				decoded, err := base64.StdEncoding.DecodeString(encoded)
@@ -914,7 +1249,7 @@ func handleBaleProxy(ctx context.Context, cfg *config.Config, lkClient *livekit.
 		case <-ctx.Done():
 			mainLog.Info("%s Context cancelled", tag)
 			return
-		case msg := <-baleClient.TextMsgCh:
+		case msg := <-baleClient.GetTextMsgCh():
 			if msg == "BLETUN:END" {
 				adminPanel.AddLog("info", tag+" 📴 Client sent END — closing session")
 				mainLog.Info("%s Client sent BLETUN:END", tag)
