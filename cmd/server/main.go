@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hashicorp/yamux"
 	"github.com/quic-go/quic-go"
 	"github.com/pion/webrtc/v4"
 	"github.com/salman/ble-webrtc-tun/internal/accounts"
@@ -837,31 +836,51 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 					return
 				}
 
-				adminPanel.AddLog("info", sTag+" Tunnel established via Soroush P2P!")
+				adminPanel.AddLog("info", sTag+" Tunnel established via Soroush P2P (QUIC)!")
 				adminPanel.SetTunnelStatus(func(s *admin.TunnelStatus) {
 					s.TunnelActive = true
 				})
 
-				// Setup yamux server session
-				dcConn := soroush.NewDataChannelConn(dc)
-				ymuxCfg := yamux.DefaultConfig()
-				ymuxCfg.EnableKeepAlive = true
-				ymuxCfg.KeepAliveInterval = 15 * time.Second
-				ymuxCfg.ConnectionWriteTimeout = 60 * time.Second
-				ymuxCfg.StreamCloseTimeout = 120 * time.Second
-				ymuxCfg.MaxStreamWindowSize = 16 * 1024 * 1024
-				ymuxCfg.AcceptBacklog = 1024
-				ymuxCfg.LogOutput = io.Discard
+				// Wrap the DataChannel as a packet-oriented net.PacketConn.
+				// The client calls quic.Dial() on this; we call quic.Listen().
+				dcPC := soroush.NewDCPacketConn(dc)
+				defer dcPC.Close()
 
-				ymuxSess, err := yamux.Server(dcConn, ymuxCfg)
-				if err != nil {
-					adminPanel.AddLog("error", sTag+" Yamux server: "+err.Error())
+				soroushTLS, tlsErr := quicconn.ServerTLSConfig()
+				if tlsErr != nil {
+					adminPanel.AddLog("error", sTag+" TLS config: "+tlsErr.Error())
 					return
 				}
-				defer ymuxSess.Close()
 
-				mainLog.Info("%s Yamux proxy active (Soroush P2P)", sTag)
-				go handleYamuxSession(ymuxSess)
+				qListener, err := quic.Listen(dcPC, soroushTLS, &quic.Config{
+					MaxIdleTimeout:                 30 * time.Second,
+					KeepAlivePeriod:                10 * time.Second,
+					InitialStreamReceiveWindow:     2 * 1024 * 1024,
+					MaxStreamReceiveWindow:         16 * 1024 * 1024,
+					InitialConnectionReceiveWindow: 4 * 1024 * 1024,
+					MaxConnectionReceiveWindow:     16 * 1024 * 1024,
+					DisablePathMTUDiscovery:        true,
+				})
+				if err != nil {
+					adminPanel.AddLog("error", sTag+" QUIC listen failed: "+err.Error())
+					mainLog.Error("%s QUIC listen: %v", sTag, err)
+					return
+				}
+				defer qListener.Close()
+
+				mainLog.Info("%s QUIC listener ready — accepting client connection...", sTag)
+
+				qConn, err := qListener.Accept(sctx)
+				if err != nil {
+					mainLog.Error("%s QUIC accept: %v", sTag, err)
+					return
+				}
+				defer qConn.CloseWithError(0, "session end")
+
+				mainLog.Info("%s ✅ QUIC connection accepted! Starting stream proxy...", sTag)
+
+				// Proxy QUIC streams to the local TUN / IP router
+				go handleQUICSession(sctx, qConn)
 
 				// Monitor session termination
 				for {
@@ -1083,6 +1102,13 @@ drainLoop:
 			})
 		}
 	}
+}
+
+// handleQUICSession proxies all QUIC streams from a single connection.
+// Used for Soroush P2P sessions where each QUIC connection is accepted
+// from a DCPacketConn listener (one connection per call).
+func handleQUICSession(ctx context.Context, qconn quic.Connection) {
+	handleQUICConn(ctx, qconn)
 }
 
 // handleQUICConn accepts streams from one QUIC connection and proxies each to the internet.

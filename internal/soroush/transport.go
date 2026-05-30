@@ -19,14 +19,18 @@ const (
 	WsUA     = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
 )
 
-var obfuscateTag = []byte{0xef, 0xef, 0xef, 0xef}
+// obfuscateTag selects the MTProto Intermediate framing protocol (0xee).
+// 0xef = Abridged (does NOT work over WebSocket — wrong frame format)
+// 0xee = Intermediate (correct for WebSocket tunneling)
+var obfuscateTag = []byte{0xee, 0xee, 0xee, 0xee}
 
-// forbidden first bytes that must be avoided in the obfuscation header
+// forbidden start sequences that would be misinterpreted by Soroush's proxy
 var forbidden = [][]byte{
-	{0x50, 0x56, 0x72, 0x47}, // PVrG
-	{0x47, 0x45, 0x54},       // GET
-	{0x50, 0x4f, 0x53, 0x54}, // POST
-	{0xee, 0xee, 0xee, 0xee},
+	{0x50, 0x56, 0x72, 0x47},             // PVrG (client handshake replay)
+	{0x47, 0x45, 0x54},                   // GET
+	{0x50, 0x4f, 0x53, 0x54},             // POST
+	{0xee, 0xee, 0xee, 0xee},             // Intermediate tag prefix (reserved)
+	{0xef, 0xef, 0xef, 0xef},             // Abridged tag prefix (reserved)
 }
 
 // ObfuscatedTransport wraps a WebSocket connection with MTProto obfuscation.
@@ -48,7 +52,9 @@ func (t *ObfuscatedTransport) initHeader() []byte {
 		n := make([]byte, 64)
 		rand.Read(n)
 
-		if n[0] == 0xEF {
+		// Reject any header whose first byte matches a known protocol identifier
+		// or our own obfuscation tag (which lives at bytes 56-59, not 0-3).
+		if n[0] == 0xEF || n[0] == 0xEE {
 			continue
 		}
 		if n[4] == 0 && n[5] == 0 && n[6] == 0 && n[7] == 0 {
@@ -113,18 +119,25 @@ func (t *ObfuscatedTransport) Connect(ctx context.Context) error {
 	}
 
 	opts := &websocket.DialOptions{
-		Subprotocols: []string{"binary"},
+		// v1.mtproto signals the Soroush edge proxy to use WS-framed MTProto.
+		// Without it the proxy may drop into raw TCP mode, corrupting framing.
+		Subprotocols: []string{"binary", "v1.mtproto"},
 		HTTPHeader: http.Header{
 			"Origin":          {WsOrigin},
 			"User-Agent":      {WsUA},
 			"Accept-Language": {"fa-IR,fa;q=0.9,en;q=0.8"},
 			"Cache-Control":   {"no-cache"},
+			"Pragma":          {"no-cache"},
 		},
 		HTTPClient: &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig: tlsConfig,
 			},
 		},
+		// CRITICAL: disabling deflate prevents RSV1 being set on compressed frames.
+		// When compression is active, Soroush's proxy sees RSV1=1 and treats it
+		// as a raw TCP obfuscation byte, corrupting the entire stream.
+		CompressionMode: websocket.CompressionDisabled,
 	}
 
 	ws, _, err := websocket.Dial(ctx, WsURI, opts)
