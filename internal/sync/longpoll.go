@@ -153,14 +153,16 @@ func (w *LongPollWorker) pollLoop() {
 
 // accountData is the wire format for accounts in sync snapshots.
 type accountData struct {
-	ID          uint   `json:"id"`
-	BaleUserID  int64  `json:"bale_user_id"`
-	Token       string `json:"token,omitempty"` // May be empty (hidden in JSON)
-	Role        string `json:"role"`
-	Status      string `json:"status"`
-	DisplayName string `json:"display_name"`
-	Phone       string `json:"phone"`
-	Enabled     bool   `json:"enabled"`
+	ID           uint   `json:"id"`
+	ProviderType string `json:"provider_type"`
+	ExternalID   int64  `json:"external_id"`
+	BaleUserID   int64  `json:"bale_user_id"`
+	Token        string `json:"token,omitempty"` // May be empty (hidden in JSON)
+	Role         string `json:"role"`
+	Status       string `json:"status"`
+	DisplayName  string `json:"display_name"`
+	Phone        string `json:"phone"`
+	Enabled      bool   `json:"enabled"`
 }
 
 // pairingData is the wire format for pairings in sync snapshots.
@@ -179,27 +181,55 @@ func (w *LongPollWorker) applySnapshot(remoteAccounts []accountData, remotePairi
 	// Only sync SERVER accounts from the remote server
 	// (CLIENT accounts are managed locally by the client admin)
 	localAccounts, _ := w.database.ListAccounts("")
-	localAccountMap := make(map[int64]*db.Account) // keyed by BaleUserID
+	
+	type accountKey struct {
+		providerType string
+		externalID   int64
+	}
+	
+	localAccountMap := make(map[accountKey]*db.Account)
 	for i := range localAccounts {
-		localAccountMap[localAccounts[i].BaleUserID] = &localAccounts[i]
+		prov := localAccounts[i].ProviderType
+		if prov == "" {
+			prov = "bale"
+		}
+		extID := localAccounts[i].ExternalID
+		if extID == 0 {
+			extID = localAccounts[i].BaleUserID
+		}
+		localAccountMap[accountKey{prov, extID}] = &localAccounts[i]
 	}
 
 	// Track remote SERVER accounts
-	remoteServerBaleIDs := make(map[int64]bool)
+	remoteServerKeys := make(map[accountKey]bool)
 
 	for _, ra := range remoteAccounts {
 		if ra.Role != db.RoleServer {
 			continue // Only sync SERVER accounts from the remote
 		}
-		remoteServerBaleIDs[ra.BaleUserID] = true
+		
+		prov := ra.ProviderType
+		if prov == "" {
+			prov = "bale"
+		}
+		extID := ra.ExternalID
+		if extID == 0 {
+			extID = ra.BaleUserID
+		}
+		if extID == 0 {
+			continue
+		}
+		
+		key := accountKey{prov, extID}
+		remoteServerKeys[key] = true
 
-		local, exists := localAccountMap[ra.BaleUserID]
+		local, exists := localAccountMap[key]
 		if !exists {
 			// Create SERVER account locally
-			lpLog.Info("Creating server account locally: Bale %d (%s)", ra.BaleUserID, ra.DisplayName)
-			acct, err := w.database.CreateAccount("", ra.Role, ra.BaleUserID)
+			lpLog.Info("Creating server account locally: %s %d (%s)", prov, extID, ra.DisplayName)
+			acct, err := w.database.CreateAccountWithProvider("", ra.Role, extID, prov)
 			if err != nil {
-				lpLog.Warn("Failed to create server account %d: %v", ra.BaleUserID, err)
+				lpLog.Warn("Failed to create server account %s %d: %v", prov, extID, err)
 				continue
 			}
 			if ra.DisplayName != "" || ra.Phone != "" {
@@ -207,8 +237,8 @@ func (w *LongPollWorker) applySnapshot(remoteAccounts []accountData, remotePairi
 			}
 		} else if local.Role != db.RoleServer {
 			// Conflict: this account exists locally with a different role
-			lpLog.Warn("Role conflict for Bale %d: local=%s remote=%s — skipping",
-				ra.BaleUserID, local.Role, ra.Role)
+			lpLog.Warn("Role conflict for %s %d: local=%s remote=%s — skipping",
+				prov, extID, local.Role, ra.Role)
 		} else {
 			// Update display info if changed
 			if (ra.DisplayName != "" && ra.DisplayName != local.DisplayName) ||
@@ -221,10 +251,20 @@ func (w *LongPollWorker) applySnapshot(remoteAccounts []accountData, remotePairi
 	// Remove SERVER accounts locally that no longer exist on the server
 	// GUARD: If the server returned 0 SERVER accounts, it likely just restarted
 	// with an empty DB — do NOT delete local accounts in that case.
-	if len(remoteServerBaleIDs) > 0 {
+	if len(remoteServerKeys) > 0 {
 		for _, localAcct := range localAccounts {
-			if localAcct.Role == db.RoleServer && !remoteServerBaleIDs[localAcct.BaleUserID] {
-				lpLog.Info("Removing deleted server account: Bale %d", localAcct.BaleUserID)
+			prov := localAcct.ProviderType
+			if prov == "" {
+				prov = "bale"
+			}
+			extID := localAcct.ExternalID
+			if extID == 0 {
+				extID = localAcct.BaleUserID
+			}
+			key := accountKey{prov, extID}
+
+			if localAcct.Role == db.RoleServer && !remoteServerKeys[key] {
+				lpLog.Info("Removing deleted server account: %s %d", prov, extID)
 				// Delete associated pairings first
 				pairings, _ := w.database.ListPairings()
 				for _, p := range pairings {
@@ -249,15 +289,53 @@ func (w *LongPollWorker) applySnapshot(remoteAccounts []accountData, remotePairi
 func (w *LongPollWorker) syncPairings(remotePairings []pairingData) {
 	localPairings, _ := w.database.ListPairings()
 
-	// Build a map of existing local pairings by (clientBaleID, serverBaleID)
-	type pairingKey struct {
-		clientBaleID int64
-		serverBaleID int64
+	type accountKey struct {
+		providerType string
+		externalID   int64
 	}
+	type pairingKey struct {
+		client accountKey
+		server accountKey
+	}
+
+	getAccountKey := func(acct *db.Account) accountKey {
+		if acct == nil {
+			return accountKey{}
+		}
+		prov := acct.ProviderType
+		if prov == "" {
+			prov = "bale"
+		}
+		extID := acct.ExternalID
+		if extID == 0 {
+			extID = acct.BaleUserID
+		}
+		return accountKey{prov, extID}
+	}
+
+	getRemoteAccountKey := func(acct *accountData) accountKey {
+		if acct == nil {
+			return accountKey{}
+		}
+		prov := acct.ProviderType
+		if prov == "" {
+			prov = "bale"
+		}
+		extID := acct.ExternalID
+		if extID == 0 {
+			extID = acct.BaleUserID
+		}
+		return accountKey{prov, extID}
+	}
+
+	// Build a map of existing local pairings
 	localPairingMap := make(map[pairingKey]uint)
 	for _, p := range localPairings {
 		if p.ClientAccount != nil && p.ServerAccount != nil {
-			key := pairingKey{p.ClientAccount.BaleUserID, p.ServerAccount.BaleUserID}
+			key := pairingKey{
+				client: getAccountKey(p.ClientAccount),
+				server: getAccountKey(p.ServerAccount),
+			}
 			localPairingMap[key] = p.ID
 		}
 	}
@@ -270,21 +348,26 @@ func (w *LongPollWorker) syncPairings(remotePairings []pairingData) {
 			continue
 		}
 
-		key := pairingKey{rp.ClientAccount.BaleUserID, rp.ServerAccount.BaleUserID}
+		key := pairingKey{
+			client: getRemoteAccountKey(rp.ClientAccount),
+			server: getRemoteAccountKey(rp.ServerAccount),
+		}
 		remotePairingKeys[key] = true
 
 		if _, exists := localPairingMap[key]; !exists {
 			// Create this pairing locally
-			clientAcct, _ := w.database.GetAccountByBaleUserID(key.clientBaleID)
-			serverAcct, _ := w.database.GetAccountByBaleUserID(key.serverBaleID)
+			clientAcct, _ := w.database.GetAccountByExternalID(key.client.providerType, key.client.externalID)
+			serverAcct, _ := w.database.GetAccountByExternalID(key.server.providerType, key.server.externalID)
 			if clientAcct != nil && serverAcct != nil {
 				_, err := w.database.CreatePairing(clientAcct.ID, serverAcct.ID, "")
 				if err != nil {
-					lpLog.Warn("Failed to create pairing (client=%d server=%d): %v",
-						key.clientBaleID, key.serverBaleID, err)
+					lpLog.Warn("Failed to create pairing (client=%s:%d server=%s:%d): %v",
+						key.client.providerType, key.client.externalID,
+						key.server.providerType, key.server.externalID, err)
 				} else {
-					lpLog.Info("Created pairing: client=%d server=%d",
-						key.clientBaleID, key.serverBaleID)
+					lpLog.Info("Created pairing: client=%s:%d server=%s:%d",
+						key.client.providerType, key.client.externalID,
+						key.server.providerType, key.server.externalID)
 				}
 			}
 		}
@@ -295,8 +378,9 @@ func (w *LongPollWorker) syncPairings(remotePairings []pairingData) {
 	if len(remotePairingKeys) > 0 {
 		for key, pairingID := range localPairingMap {
 			if !remotePairingKeys[key] {
-				lpLog.Info("Removing deleted pairing: client=%d server=%d",
-					key.clientBaleID, key.serverBaleID)
+				lpLog.Info("Removing deleted pairing: client=%s:%d server=%s:%d",
+					key.client.providerType, key.client.externalID,
+					key.server.providerType, key.server.externalID)
 				w.database.DeletePairing(pairingID)
 			}
 		}

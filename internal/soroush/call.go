@@ -1,8 +1,8 @@
 package soroush
 
-// ──────────────────────────────────────────────────────────────────────────────
-// MTProto constructor IDs for Soroush voice call signaling
-// ──────────────────────────────────────────────────────────────────────────────
+import (
+	"sync"
+)
 //
 // These are derived from the Telegram MTProto TL schema that Soroush uses.
 // Soroush voice calls follow the same phone.requestCall / phone.acceptCall
@@ -418,3 +418,42 @@ func ParsePhoneCallResult(cid uint32, r *TLReader) (*CallEvent, error) {
 	// phone_call field
 	return ParseCallUpdate(r)
 }
+
+var (
+	callEventsMu       sync.RWMutex
+	callEventListeners = make(map[int64]chan *CallEvent)
+)
+
+func RegisterCallEventListener(callID int64, ch chan *CallEvent) {
+	callEventsMu.Lock()
+	defer callEventsMu.Unlock()
+	callEventListeners[callID] = ch
+}
+
+func UnregisterCallEventListener(callID int64) {
+	callEventsMu.Lock()
+	defer callEventsMu.Unlock()
+	delete(callEventListeners, callID)
+}
+
+func DispatchCallEvent(event *CallEvent) {
+	callEventsMu.RLock()
+	defer callEventsMu.RUnlock()
+
+	if ch, ok := callEventListeners[event.CallID]; ok {
+		select {
+		case ch <- event:
+		default:
+		}
+		return
+	}
+
+	// wildcard listener for incoming calls or pending requests
+	if ch, ok := callEventListeners[0]; ok {
+		select {
+		case ch <- event:
+		default:
+		}
+	}
+}
+

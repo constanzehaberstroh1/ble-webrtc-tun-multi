@@ -1,0 +1,29 @@
+{
+  "version": "1.0",
+  "role": "server",
+  "created_at": "2026-05-31T09:29:41Z",
+  "accounts": [
+    {
+      "bale_user_id": 0,
+      "token": "",
+      "token_hash": "",
+      "role": "SERVER",
+      "display_name": "اکبر مزینانی",
+      "phone": "+989371153301",
+      "access_hash": 1,
+      "enabled": true
+    },
+    {
+      "bale_user_id": 0,
+      "token": "",
+      "token_hash": "",
+      "role": "CLIENT",
+      "display_name": "محمد علی صاحب",
+      "phone": "+989355664046",
+      "access_hash": 0,
+      "enabled": true
+    }
+  ],
+  "pairings": [],
+  "settings": []
+}

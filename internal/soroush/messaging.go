@@ -587,13 +587,17 @@ func processUpdate(cid uint32, r *TLReader, session *MTProtoSession, handler fun
 			parseUpdateNewMessage(r, handler)
 		} else if innerCID == IDUpdatePhoneCall {
 			callEvent, err := ParseCallUpdate(r)
-			if err == nil && callEvent != nil && callEvent.Type == "requested" {
-				handler(IncomingMessage{
-					FromUserID: callEvent.AdminID,
-					Text:       fmt.Sprintf("CALL_REQUESTED:%d:%d:%d", callEvent.CallID, callEvent.AdminID, callEvent.AccessHash),
-				})
+			if err == nil && callEvent != nil {
+				DispatchCallEvent(callEvent)
+				if callEvent.Type == "requested" {
+					handler(IncomingMessage{
+						FromUserID: callEvent.AdminID,
+						Text:       fmt.Sprintf("CALL_REQUESTED:%d:%d:%d", callEvent.CallID, callEvent.AdminID, callEvent.AccessHash),
+					})
+				}
 			}
 		}
+
 		return
 
 	case IDUpdateShortSentMessage:
@@ -679,13 +683,17 @@ func parseUpdates(r *TLReader, handler func(msg IncomingMessage)) {
 			parseUpdateNewMessage(r, handler)
 		} else if updateCID == IDUpdatePhoneCall {
 			callEvent, err := ParseCallUpdate(r)
-			if err == nil && callEvent != nil && callEvent.Type == "requested" {
-				handler(IncomingMessage{
-					FromUserID: callEvent.AdminID,
-					Text:       fmt.Sprintf("CALL_REQUESTED:%d:%d:%d", callEvent.CallID, callEvent.AdminID, callEvent.AccessHash),
-				})
+			if err == nil && callEvent != nil {
+				DispatchCallEvent(callEvent)
+				if callEvent.Type == "requested" {
+					handler(IncomingMessage{
+						FromUserID: callEvent.AdminID,
+						Text:       fmt.Sprintf("CALL_REQUESTED:%d:%d:%d", callEvent.CallID, callEvent.AdminID, callEvent.AccessHash),
+					})
+				}
 			}
 		}
+
 		// Skip other update types gracefully
 	}
 }

@@ -16,24 +16,26 @@ import (
 
 // SoroushClientAdapter wraps the Soroush MTProto session to satisfy provider.Client
 type SoroushClientAdapter struct {
-	authKey      []byte
-	authKeyID    []byte
-	serverSalt   []byte
-	userID       int64
-	accessHash   int64
-	session      *MTProtoSession
-	transport    *ObfuscatedTransport
-	callCh       chan *provider.IncomingCall
-	textCh       chan string
-	ctx          context.Context
-	cancel       context.CancelFunc
-	pingStopCh   chan struct{}
-	connected    bool
-	mu           sync.Mutex
+	authKey            []byte
+	authKeyID          []byte
+	serverSalt         []byte
+	userID             int64
+	accessHash         int64
+	session            *MTProtoSession
+	transport          *ObfuscatedTransport
+	callCh             chan *provider.IncomingCall
+	textCh             chan string
+	ctx                context.Context
+	cancel             context.CancelFunc
+	pingStopCh         chan struct{}
+	connected          bool
+	mu                 sync.Mutex
+	lastIncomingCallID int64
 
 	activeCallsMu      sync.RWMutex
 	activeCallAccesses map[int64]int64 // maps callID -> accessHash
 }
+
 
 func NewSoroushClientAdapter(authKey, authKeyID, serverSalt []byte, userID, accessHash int64) *SoroushClientAdapter {
 	return &SoroushClientAdapter{
@@ -175,10 +177,56 @@ func (c *SoroushClientAdapter) GetWssURL(callID int64) error {
 
 // WaitForAccept implements provider.Client
 func (c *SoroushClientAdapter) WaitForAccept(timeout time.Duration) (*provider.CallAcceptResult, error) {
-	// For Soroush, wait for confirmed (active call) or accepted updates on transport
-	// However, TURN server addresses can be returned dynamically or from default list.
-	// Since domestic Iranian TURN servers are constant and highly reliable, we can
-	// return them directly to ensure instant connectivity!
+	c.mu.Lock()
+	callID := c.lastIncomingCallID
+	c.mu.Unlock()
+
+	if callID == 0 {
+		return c.defaultCallAcceptResult(), nil
+	}
+
+	eventCh := make(chan *CallEvent, 10)
+	RegisterCallEventListener(callID, eventCh)
+	defer UnregisterCallEventListener(callID)
+
+	select {
+	case <-c.ctx.Done():
+		return nil, c.ctx.Err()
+	case ev := <-eventCh:
+		if ev.Type == "discarded" {
+			return nil, errors.New("call discarded/ended by remote")
+		}
+		if ev.Type == "confirmed" {
+			conns := make([]provider.ICEConnectionInfo, 0)
+			if len(ev.Connections) > 0 {
+				for _, conn := range ev.Connections {
+					turnURL := fmt.Sprintf("turn:%s:%d", conn.IP, conn.Port)
+					if conn.Stun {
+						turnURL = fmt.Sprintf("stun:%s:%d", conn.IP, conn.Port)
+					}
+					if conn.Turn && !strings.Contains(turnURL, "?transport=tcp") {
+						turnURL += "?transport=tcp"
+					}
+					conns = append(conns, provider.ICEConnectionInfo{
+						URL:      turnURL,
+						Username: conn.Username,
+						Password: conn.Password,
+						IsTurn:   conn.Turn,
+					})
+				}
+			}
+			if len(conns) > 0 {
+				return &provider.CallAcceptResult{Connections: conns}, nil
+			}
+		}
+	case <-time.After(timeout):
+		// Fallback on timeout
+	}
+
+	return c.defaultCallAcceptResult(), nil
+}
+
+func (c *SoroushClientAdapter) defaultCallAcceptResult() *provider.CallAcceptResult {
 	conns := make([]provider.ICEConnectionInfo, 0)
 	for _, srv := range SoroushTURNServers {
 		for _, url := range srv.URLs {
@@ -190,11 +238,11 @@ func (c *SoroushClientAdapter) WaitForAccept(timeout time.Duration) (*provider.C
 			})
 		}
 	}
-
 	return &provider.CallAcceptResult{
 		Connections: conns,
-	}, nil
+	}
 }
+
 
 // DiscardCall implements provider.Client
 func (c *SoroushClientAdapter) DiscardCall(callID int64) error {
@@ -223,84 +271,104 @@ func (c *SoroushClientAdapter) InitiateCall(ctx context.Context, targetUserID in
 	gAHash := make([]byte, 32)
 	_, _ = rand.Read(gAHash)
 
+	gA := make([]byte, 256)
+	_, _ = rand.Read(gA)
+
 	randomID := rand.Int31()
 
+	eventCh := make(chan *CallEvent, 10)
+	RegisterCallEventListener(0, eventCh)
+	defer UnregisterCallEventListener(0)
+
 	callBody := BuildPhoneRequestCall(targetUserID, targetAccessHash, randomID, gAHash)
-	callCtx, callCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer callCancel()
-
-	// Wait for call acceptance or confirmation
-	callRecvCh := make(chan error, 1)
-	var acceptedEvent *CallEvent
-
-	go func() {
-		for {
-			select {
-			case <-callCtx.Done():
-				callRecvCh <- callCtx.Err()
-				return
-			default:
-			}
-
-			cid, reader, err := c.session.Recv(callCtx)
-			if err != nil {
-				callRecvCh <- err
-				return
-			}
-
-			// Parse call updates
-			innerCID := cid
-			innerReader := reader
-			if cid == IDMsgContainer {
-				count, _ := reader.ReadInt32()
-				for i := int32(0); i < count; i++ {
-					reader.ReadInt64() // msg_id
-					reader.ReadInt32() // seq_no
-					bodyLen, _ := reader.ReadInt32()
-					body, err := reader.ReadRaw(int(bodyLen))
-					if err == nil {
-						subReader := NewTLReader(body)
-						subCID, _ := subReader.ReadUint32()
-						if subCID == IDUpdatePhoneCall {
-							innerCID = subCID
-							innerReader = subReader
-							break
-						}
-					}
-				}
-			}
-
-			if innerCID == IDUpdatePhoneCall {
-				event, err := ParseCallUpdate(innerReader)
-				if err == nil && event != nil {
-					if event.Type == "accepted" || event.Type == "confirmed" {
-						acceptedEvent = event
-						callRecvCh <- nil
-						return
-					}
-				}
-			}
-		}
-	}()
-
-	// Send request call
-	_, err := c.session.Send(callCtx, callBody, true)
+	_, err := c.session.Send(ctx, callBody, true)
 	if err != nil {
 		return nil, fmt.Errorf("send requestCall failed: %w", err)
 	}
 
-	err = <-callRecvCh
-	if err != nil {
-		return nil, fmt.Errorf("waiting for call acceptance failed: %w", err)
+	var callID int64
+	var callAccessHash int64
+	var acceptedEvent *CallEvent
+
+	// Step 1: Wait for call to be created (waiting state)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case ev := <-eventCh:
+		if ev.Type == "discarded" {
+			return nil, errors.New("call discarded/rejected immediately")
+		}
+		callID = ev.CallID
+		callAccessHash = ev.AccessHash
+	case <-time.After(15 * time.Second):
+		return nil, errors.New("timeout waiting for call to initiate")
 	}
 
-	// Prepare results
+	// Register specific listener for this call ID
+	RegisterCallEventListener(callID, eventCh)
+	defer UnregisterCallEventListener(callID)
+	// Unregister from wildcard so we don't leak/duplicate
+	UnregisterCallEventListener(0)
+
+	// Step 2: Wait for callee to accept the call
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case ev := <-eventCh:
+		if ev.Type == "discarded" {
+			return nil, errors.New("call rejected/discarded by callee")
+		}
+		if ev.Type == "accepted" {
+			acceptedEvent = ev
+		} else {
+			return nil, fmt.Errorf("unexpected call event type: %s", ev.Type)
+		}
+	case <-time.After(30 * time.Second):
+		return nil, errors.New("timeout waiting for callee to accept call")
+	}
+
+	// Send confirmCall
+	confirmBody := BuildPhoneConfirmCall(callID, callAccessHash, gA, 0)
+	_, err = c.session.Send(ctx, confirmBody, true)
+	if err != nil {
+		return nil, fmt.Errorf("send confirmCall failed: %w", err)
+	}
+
+	// Step 3: Wait for call to transition to active (confirmed)
+	var activeEvent *CallEvent
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case ev := <-eventCh:
+		if ev.Type == "discarded" {
+			return nil, errors.New("call discarded during confirmation")
+		}
+		if ev.Type == "confirmed" {
+			activeEvent = ev
+		} else {
+			return nil, fmt.Errorf("unexpected call event during confirmation: %s", ev.Type)
+		}
+	case <-time.After(15 * time.Second):
+		return nil, errors.New("timeout waiting for call confirmation")
+	}
+
+	// Prepare results (connections)
 	conns := make([]provider.ICEConnectionInfo, 0)
-	if acceptedEvent != nil && len(acceptedEvent.Connections) > 0 {
-		for _, conn := range acceptedEvent.Connections {
+	// We check connections from activeEvent first, fallback to acceptedEvent
+	sourceConnections := activeEvent.Connections
+	if len(sourceConnections) == 0 && acceptedEvent != nil {
+		sourceConnections = acceptedEvent.Connections
+	}
+
+	if len(sourceConnections) > 0 {
+		for _, conn := range sourceConnections {
 			turnURL := fmt.Sprintf("turn:%s:%d", conn.IP, conn.Port)
 			if conn.Stun {
 				turnURL = fmt.Sprintf("stun:%s:%d", conn.IP, conn.Port)
+			}
+			// Soroush WebRTC connection requires tcp transport option for TURN
+			if conn.Turn && !strings.Contains(turnURL, "?transport=tcp") {
+				turnURL += "?transport=tcp"
 			}
 			conns = append(conns, provider.ICEConnectionInfo{
 				URL:      turnURL,
@@ -396,6 +464,10 @@ func (c *SoroushClientAdapter) runMessageReader() {
 				callID, _ := strconv.ParseInt(parts[1], 10, 64)
 				callerID, _ := strconv.ParseInt(parts[2], 10, 64)
 				accessHash, _ := strconv.ParseInt(parts[3], 10, 64)
+
+				c.mu.Lock()
+				c.lastIncomingCallID = callID
+				c.mu.Unlock()
 
 				c.activeCallsMu.Lock()
 				c.activeCallAccesses[callID] = accessHash

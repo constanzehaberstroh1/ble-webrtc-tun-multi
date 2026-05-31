@@ -1,0 +1,27 @@
+{
+  "title": "Server",
+  "metas": {
+    "title": "سروش پلاس",
+    "description": "سروش پلاس یک اپلیکیشن پیام رسان موبایل و دسکتاپ مبتنی بر ابر با تمرکز بر امنیت و سرعت است.",
+    "viewport": "width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,shrink-to-fit=no,viewport-fit=cover",
+    "mobile-web-app-capable": "yes",
+    "mobile-web-app-title": "سروش پلاس",
+    "apple-mobile-web-app-capable": "yes",
+    "apple-mobile-web-app-title": "سروش پلاس",
+    "application-name": "سروش پلاس",
+    "msapplication-TileColor": "#2b5797",
+    "msapplication-config": "./browserconfig.xml",
+    "theme-color": "#fff",
+    "google": "notranslate",
+    "og:type": "website",
+    "og:url": "https://web.splus.ir/",
+    "og:title": "سروش پلاس",
+    "og:description": "سروش پلاس یک اپلیکیشن پیام رسان موبایل و دسکتاپ مبتنی بر ابر با تمرکز بر امنیت و سرعت است.",
+    "og:image": "./icon-192x192.png",
+    "twitter:card": "summary_large_image",
+    "twitter:url": "https://web.splus.ir/",
+    "twitter:title": "سروش پلاس",
+    "twitter:description": "سروش پلاس یک اپلیکیشن پیام رسان موبایل و دسکتاپ مبتنی بر ابر با تمرکز بر امنیت و سرعت است.",
+    "twitter:image": "./icon-192x192.png"
+  }
+}

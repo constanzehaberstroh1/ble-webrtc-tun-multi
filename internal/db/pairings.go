@@ -26,6 +26,18 @@ func (d *Database) CreatePairing(clientAccountID, serverAccountID uint, ownerID 
 		return nil, fmt.Errorf("account %d is not a SERVER account", serverAccountID)
 	}
 
+	clientProv := client.ProviderType
+	if clientProv == "" {
+		clientProv = "bale"
+	}
+	serverProv := server.ProviderType
+	if serverProv == "" {
+		serverProv = "bale"
+	}
+	if clientProv != serverProv {
+		return nil, fmt.Errorf("provider mismatch: cannot pair %s client with %s server", clientProv, serverProv)
+	}
+
 	// Enforce exclusivity: server account must not be actively paired by another owner
 	var existingPairing Pairing
 	err := d.DB.Where("server_account_id = ? AND active = ? AND owner_id != ?", serverAccountID, true, ownerID).
@@ -162,23 +174,44 @@ func (d *Database) AutoPairUnmatched(ownerID string) (int, error) {
 			return err
 		}
 
-		// Pair them 1:1
-		n := len(unpairedClients)
-		if len(availableServers) < n {
-			n = len(availableServers)
-		}
+		// Pair them 1:1 matching provider type
+		for _, clientAcct := range unpairedClients {
+			clientProv := clientAcct.ProviderType
+			if clientProv == "" {
+				clientProv = "bale"
+			}
 
-		for i := 0; i < n; i++ {
-			pairing := &Pairing{
-				ClientAccountID: unpairedClients[i].ID,
-				ServerAccountID: availableServers[i].ID,
-				OwnerID:         ownerID,
-				Active:          true,
+			// Find first available server with same provider type
+			serverIdx := -1
+			for idx, serverAcct := range availableServers {
+				serverProv := serverAcct.ProviderType
+				if serverProv == "" {
+					serverProv = "bale"
+				}
+				if clientProv == serverProv {
+					serverIdx = idx
+					break
+				}
 			}
-			if err := tx.Create(pairing).Error; err != nil {
-				return err
+
+			// If matched, pair them
+			if serverIdx != -1 {
+				matchedServer := availableServers[serverIdx]
+				
+				// Remove matched server from available list
+				availableServers = append(availableServers[:serverIdx], availableServers[serverIdx+1:]...)
+
+				pairing := &Pairing{
+					ClientAccountID: clientAcct.ID,
+					ServerAccountID: matchedServer.ID,
+					OwnerID:         ownerID,
+					Active:          true,
+				}
+				if err := tx.Create(pairing).Error; err != nil {
+					return err
+				}
+				count++
 			}
-			count++
 		}
 
 		return nil

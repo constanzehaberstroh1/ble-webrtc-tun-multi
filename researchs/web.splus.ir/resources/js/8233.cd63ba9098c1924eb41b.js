@@ -1,0 +1,2 @@
+(self.webpackChunkSoroushPlus=self.webpackChunkSoroushPlus||[]).push([[8233],{99040(e){e.exports=function(e){return{name:"Plain text",aliases:["text","txt"],disableAutodetect:!0}}}}]);
+//# sourceMappingURL=8233.cd63ba9098c1924eb41b.js.map
