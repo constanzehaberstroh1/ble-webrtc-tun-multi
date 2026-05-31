@@ -1,2 +1,0 @@
-(self.webpackChunkSoroushPlus=self.webpackChunkSoroushPlus||[]).push([[7612],{20283(s){s.exports=function(s){return{aliases:["pycon"],contains:[{className:"meta.prompt",starts:{end:/ |$/,starts:{end:"$",subLanguage:"python"}},variants:[{begin:/^>>>(?=[ ]|$)/},{begin:/^\.\.\.(?=[ ]|$)/}]}]}}}}]);
-//# sourceMappingURL=7612.4206378e18c5a4b089bd.js.map

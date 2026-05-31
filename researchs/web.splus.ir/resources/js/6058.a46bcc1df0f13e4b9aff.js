@@ -1,2 +1,0 @@
-(self.webpackChunkSoroushPlus=self.webpackChunkSoroushPlus||[]).push([[6058],{16673(s){s.exports=function(s){return{name:"Node REPL",contains:[{className:"meta.prompt",starts:{end:/ |$/,starts:{end:"$",subLanguage:"javascript"}},variants:[{begin:/^>(?=[ ]|$)/},{begin:/^\.\.\.(?=[ ]|$)/}]}]}}}}]);
-//# sourceMappingURL=6058.a46bcc1df0f13e4b9aff.js.map

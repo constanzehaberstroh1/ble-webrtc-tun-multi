@@ -1,2 +1,0 @@
-"use strict";(self.webpackChunkSoroushPlus=self.webpackChunkSoroushPlus||[]).push([[7643],{27643(s,u,e){e.r(u),e.d(u,{default:()=>l});var h=e(44903);const l=e.n(h)()}}]);
-//# sourceMappingURL=7643.0f81498859eaa6d63021.js.map

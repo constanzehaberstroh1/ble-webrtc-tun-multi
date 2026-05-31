@@ -1,2 +1,0 @@
-(self.webpackChunkSoroushPlus=self.webpackChunkSoroushPlus||[]).push([[9141],{10164(n){n.exports=function(n){return{name:"VBScript in HTML",subLanguage:"xml",contains:[{begin:"<%",end:"%>",subLanguage:"vbscript"}]}}}}]);
-//# sourceMappingURL=9141.f986b8bed593949bcfb2.js.map
