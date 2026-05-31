@@ -37,3 +37,9 @@ test_restricted_wifi.sh
 *.db
 ble-client
 ble-server
+researchs/*
+./researchs/*
+./researchs/*/*
+./researchs/*/*/*
+./researchs/*/*/*/*
+researchs
