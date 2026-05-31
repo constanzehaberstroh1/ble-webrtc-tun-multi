@@ -163,6 +163,7 @@ type accountData struct {
 	DisplayName  string `json:"display_name"`
 	Phone        string `json:"phone"`
 	Enabled      bool   `json:"enabled"`
+	AccessHash   int64  `json:"access_hash"`
 }
 
 // pairingData is the wire format for pairings in sync snapshots.
@@ -232,8 +233,8 @@ func (w *LongPollWorker) applySnapshot(remoteAccounts []accountData, remotePairi
 				lpLog.Warn("Failed to create server account %s %d: %v", prov, extID, err)
 				continue
 			}
-			if ra.DisplayName != "" || ra.Phone != "" {
-				w.database.UpdateAccountInfo(acct.ID, ra.DisplayName, ra.Phone, 0)
+			if ra.DisplayName != "" || ra.Phone != "" || ra.AccessHash != 0 {
+				w.database.UpdateAccountInfo(acct.ID, ra.DisplayName, ra.Phone, ra.AccessHash)
 			}
 		} else if local.Role != db.RoleServer {
 			// Conflict: this account exists locally with a different role
@@ -242,8 +243,9 @@ func (w *LongPollWorker) applySnapshot(remoteAccounts []accountData, remotePairi
 		} else {
 			// Update display info if changed
 			if (ra.DisplayName != "" && ra.DisplayName != local.DisplayName) ||
-				(ra.Phone != "" && ra.Phone != local.Phone) {
-				w.database.UpdateAccountInfo(local.ID, ra.DisplayName, ra.Phone, 0)
+				(ra.Phone != "" && ra.Phone != local.Phone) ||
+				(ra.AccessHash != 0 && ra.AccessHash != local.AccessHash) {
+				w.database.UpdateAccountInfo(local.ID, ra.DisplayName, ra.Phone, ra.AccessHash)
 			}
 		}
 	}

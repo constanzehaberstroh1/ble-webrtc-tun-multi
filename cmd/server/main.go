@@ -178,14 +178,21 @@ func runBaleSignaling(ctx context.Context, cfg *config.Config, adminPanel *admin
 
 		label := fmt.Sprintf("[Account DB:%d]", account.ID)
 
-		// Get expected caller ID from pairing
+		// Get expected caller ID from pairing for log only
 		var expectedCallerID int64
 		pairing, err := serverDB.GetPairingByServerAccount(account.ID)
 		if err == nil && pairing.ClientAccount != nil {
-			expectedCallerID = pairing.ClientAccount.BaleUserID
+			expectedCallerID = pairing.ClientAccount.ExternalID
+			if expectedCallerID == 0 {
+				expectedCallerID = pairing.ClientAccount.BaleUserID
+			}
 		}
-		mainLog.Info("%s BaleID=%d ExpectedCaller=%d — starting signaling", label, account.BaleUserID, expectedCallerID)
-		adminPanel.AddLog("info", fmt.Sprintf("%s Starting Bale signaling (BaleID=%d)", label, account.BaleUserID))
+		extID := account.ExternalID
+		if extID == 0 {
+			extID = account.BaleUserID
+		}
+		mainLog.Info("%s ExtID=%d ExpectedCaller=%d — starting signaling", label, extID, expectedCallerID)
+		adminPanel.AddLog("info", fmt.Sprintf("%s Starting signaling (ExtID=%d)", label, extID))
 
 		go func() {
 			defer func() {
@@ -193,7 +200,7 @@ func runBaleSignaling(ctx context.Context, cfg *config.Config, adminPanel *admin
 				delete(activeAccounts, account.ID)
 				mu.Unlock()
 			}()
-			runSingleAccountLoopDB(acctCtx, cfg, adminPanel, wrtc, account, expectedCallerID, label, useTUN)
+			runSingleAccountLoopDB(acctCtx, cfg, adminPanel, wrtc, account, label, useTUN)
 		}()
 	}
 
@@ -318,9 +325,22 @@ func runSingleAccountLoop(ctx context.Context, cfg *config.Config, adminPanel *a
 	}
 }
 
+// getExpectedCallerID fetches the expected caller ID for a server account dynamically from pairings.
+func getExpectedCallerID(serverAccountID uint) int64 {
+	pairing, err := serverDB.GetPairingByServerAccount(serverAccountID)
+	if err == nil && pairing.ClientAccount != nil {
+		extID := pairing.ClientAccount.ExternalID
+		if extID == 0 {
+			extID = pairing.ClientAccount.BaleUserID
+		}
+		return extID
+	}
+	return 0
+}
+
 // runSingleAccountLoopDB runs the Bale WS + call session loop for a DB-managed account.
 // Uses the router for call validation and status tracking.
-func runSingleAccountLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin.Server, wrtc *transport.WebRTCTransport, account db.Account, expectedCallerID int64, label string, useTUN bool) {
+func runSingleAccountLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin.Server, wrtc *transport.WebRTCTransport, account db.Account, label string, useTUN bool) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -377,7 +397,7 @@ func runSingleAccountLoopDB(ctx context.Context, cfg *config.Config, adminPanel 
 		time.Sleep(3 * time.Second)
 		client.DrainChannels()
 
-		runSessionLoopDB(ctx, cfg, adminPanel, wrtc, client, account, expectedCallerID, label, useTUN)
+		runSessionLoopDB(ctx, cfg, adminPanel, wrtc, client, account, label, useTUN)
 
 		// Erase all chat fingerprints before reconnecting
 		client.CleanupMessages()
@@ -538,7 +558,7 @@ func runSessionLoop(ctx context.Context, cfg *config.Config, adminPanel *admin.S
 
 // runSessionLoopDB handles incoming calls using the DB-driven router for validation.
 // Also handles terminal relay messages (BLECMD/BLERSZ/BLEEND) while waiting for calls.
-func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin.Server, _ *transport.WebRTCTransport, client provider.Client, account db.Account, expectedCallerID int64, label string, useTUN bool) {
+func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin.Server, _ *transport.WebRTCTransport, client provider.Client, account db.Account, label string, useTUN bool) {
 	callCh := client.GetCallCh()
 	sessionNum := 0
 
@@ -554,15 +574,18 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 					continue
 				}
 				// Handle ENDCALL while draining — ACK immediately
-				if msg == "BLETUN:ENDCALL" && expectedCallerID != 0 {
-					mainLog.Info("%s Received ENDCALL while draining — sending ACK", label)
-					adminPanel.AddLog("info", label+" 📴 ENDCALL received (idle) — sending ACK")
-					client.SendTextMessage(expectedCallerID, "BLETUN:ENDCALL_ACK")
-					// Also force-end in router + set IDLE (in case of stale state)
-					callRouter.ForceEndCall(account.ID)
-					serverDB.SetAccountStatus(account.ID, db.StatusIdle)
-					// Async cleanup — don't block the main loop
-					go client.CleanupMessages()
+				if msg == "BLETUN:ENDCALL" {
+					expectedCallerID := getExpectedCallerID(account.ID)
+					if expectedCallerID != 0 {
+						mainLog.Info("%s Received ENDCALL while draining — sending ACK to %d", label, expectedCallerID)
+						adminPanel.AddLog("info", label+" 📴 ENDCALL received (idle) — sending ACK")
+						client.SendTextMessage(expectedCallerID, "BLETUN:ENDCALL_ACK")
+						// Also force-end in router + set IDLE (in case of stale state)
+						callRouter.ForceEndCall(account.ID)
+						serverDB.SetAccountStatus(account.ID, db.StatusIdle)
+						// Async cleanup — don't block the main loop
+						go client.CleanupMessages()
+					}
 				}
 			default:
 				drainDone = true
@@ -590,15 +613,18 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 				}
 				// Handle ENDCALL while waiting for calls (server is idle, no active call)
 				// Send ACK so the client knows the server is ready
-				if msg == "BLETUN:ENDCALL" && expectedCallerID != 0 {
-					mainLog.Info("%s Received ENDCALL while idle — sending ACK", label)
-					adminPanel.AddLog("info", label+" 📴 ENDCALL received (idle) — sending ACK")
-					client.SendTextMessage(expectedCallerID, "BLETUN:ENDCALL_ACK")
-					// Also force-end in router + set IDLE (in case of stale state)
-					callRouter.ForceEndCall(account.ID)
-					serverDB.SetAccountStatus(account.ID, db.StatusIdle)
-					// Async cleanup — don't block the main loop
-					go client.CleanupMessages()
+				if msg == "BLETUN:ENDCALL" {
+					expectedCallerID := getExpectedCallerID(account.ID)
+					if expectedCallerID != 0 {
+						mainLog.Info("%s Received ENDCALL while idle — sending ACK to %d", label, expectedCallerID)
+						adminPanel.AddLog("info", label+" 📴 ENDCALL received (idle) — sending ACK")
+						client.SendTextMessage(expectedCallerID, "BLETUN:ENDCALL_ACK")
+						// Also force-end in router + set IDLE (in case of stale state)
+						callRouter.ForceEndCall(account.ID)
+						serverDB.SetAccountStatus(account.ID, db.StatusIdle)
+						// Async cleanup — don't block the main loop
+						go client.CleanupMessages()
+					}
 				}
 				continue
 			}
@@ -953,6 +979,7 @@ func runSessionLoopDB(ctx context.Context, cfg *config.Config, adminPanel *admin
 				defer scancel()
 				defer sfu.Close()
 
+				expectedCallerID := getExpectedCallerID(account.ID)
 				handleSFUProxy(sctx, cfg, sfu, adminPanel, client, sTag, expectedCallerID)
 
 				mainLog.Info("%s Tunnel ended — cleaning up", sTag)

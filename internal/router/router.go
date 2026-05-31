@@ -302,9 +302,15 @@ func (r *Router) ShouldAcceptCall(serverAccountID uint, callerID int64, callID i
 		if err != nil {
 			return fmt.Errorf("no pairing for server account %d", serverAccountID)
 		}
-		if pairing.ClientAccount != nil && pairing.ClientAccount.BaleUserID != callerID {
-			return fmt.Errorf("caller %d doesn't match paired client %d",
-				callerID, pairing.ClientAccount.BaleUserID)
+		if pairing.ClientAccount != nil {
+			clientExtID := pairing.ClientAccount.ExternalID
+			if clientExtID == 0 {
+				clientExtID = pairing.ClientAccount.BaleUserID
+			}
+			if clientExtID != callerID {
+				return fmt.Errorf("caller %d doesn't match paired client %d",
+					callerID, clientExtID)
+			}
 		}
 	}
 
