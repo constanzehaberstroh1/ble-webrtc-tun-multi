@@ -171,25 +171,13 @@ func (t *ObfuscatedTransport) Disconnect() {
 }
 
 // Send encrypts and sends a payload over the obfuscated WebSocket.
+// Uses MTProto Intermediate framing: 4-byte LE length (in bytes) + payload.
+// This matches the 0xeeeeeeee protocol tag sent in the obfuscation header.
 func (t *ObfuscatedTransport) Send(ctx context.Context, payload []byte) error {
-	if len(payload)%4 != 0 {
-		return fmt.Errorf("payload not multiple of 4: %d", len(payload))
-	}
-
-	n := len(payload) / 4
-	var frame []byte
-	if n < 0x7F {
-		frame = make([]byte, 1+len(payload))
-		frame[0] = byte(n)
-		copy(frame[1:], payload)
-	} else {
-		frame = make([]byte, 4+len(payload))
-		frame[0] = 0x7F
-		frame[1] = byte(n & 0xFF)
-		frame[2] = byte((n >> 8) & 0xFF)
-		frame[3] = byte((n >> 16) & 0xFF)
-		copy(frame[4:], payload)
-	}
+	// Intermediate protocol: 4-byte little-endian length (bytes) + payload
+	frame := make([]byte, 4+len(payload))
+	binary.LittleEndian.PutUint32(frame[0:4], uint32(len(payload)))
+	copy(frame[4:], payload)
 
 	encrypted := t.encrypt.Update(frame)
 
@@ -199,6 +187,7 @@ func (t *ObfuscatedTransport) Send(ctx context.Context, payload []byte) error {
 }
 
 // Recv reads and decrypts a payload from the obfuscated WebSocket.
+// Uses MTProto Intermediate framing: 4-byte LE length (in bytes) + payload.
 func (t *ObfuscatedTransport) Recv(ctx context.Context) ([]byte, error) {
 	_, raw, err := t.ws.Read(ctx)
 	if err != nil {
@@ -207,24 +196,32 @@ func (t *ObfuscatedTransport) Recv(ctx context.Context) ([]byte, error) {
 
 	decrypted := t.decrypt.Update(raw)
 
-	if len(decrypted) == 0 {
-		return nil, fmt.Errorf("transport: received empty frame")
-	}
-
-	first := decrypted[0]
-	var payload []byte
-	if first == 0x7F {
-		if len(decrypted) < 4 {
-			return nil, fmt.Errorf("transport: long frame too short: %d", len(decrypted))
+	// Intermediate protocol: first 4 bytes are the payload length (LE)
+	if len(decrypted) < 4 {
+		// If exactly 4 bytes, it's a server error code (negative int32)
+		if len(decrypted) == 4 {
+			code := int32(binary.LittleEndian.Uint32(decrypted))
+			return nil, fmt.Errorf("transport error code: %d", code)
 		}
-		payload = decrypted[4:]
-	} else {
-		payload = decrypted[1:]
+		return nil, fmt.Errorf("transport: frame too short: %d bytes", len(decrypted))
 	}
 
+	payloadLen := int(binary.LittleEndian.Uint32(decrypted[0:4]))
+
+	// Negative-looking length = server error code sent before the length header
+	if payloadLen > len(decrypted)-4 {
+		log.Printf("[Transport] WARN: claimed payloadLen=%d but frame only has %d bytes; raw frame may be an error", payloadLen, len(decrypted)-4)
+		payloadLen = len(decrypted) - 4
+	}
+
+	payload := decrypted[4 : 4+payloadLen]
+
+	// Check for 4-byte server error codes embedded in the payload
 	if len(payload) == 4 {
 		code := int32(binary.LittleEndian.Uint32(payload))
-		return nil, fmt.Errorf("transport error code: %d", code)
+		if code < 0 {
+			return nil, fmt.Errorf("transport error code: %d", code)
+		}
 	}
 
 	return payload, nil
