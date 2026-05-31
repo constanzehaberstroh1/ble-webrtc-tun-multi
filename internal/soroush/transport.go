@@ -19,18 +19,16 @@ const (
 	WsUA     = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
 )
 
-// obfuscateTag selects the MTProto Intermediate framing protocol (0xee).
-// 0xef = Abridged (does NOT work over WebSocket — wrong frame format)
-// 0xee = Intermediate (correct for WebSocket tunneling)
-var obfuscateTag = []byte{0xee, 0xee, 0xee, 0xee}
+// obfuscateTag: 0xef = MTProto Abridged protocol (matches Soroush's WebSocket proxy expectations).
+// This MUST stay 0xef to match the working relay implementation.
+var obfuscateTag = []byte{0xef, 0xef, 0xef, 0xef}
 
-// forbidden start sequences that would be misinterpreted by Soroush's proxy
+// forbidden start sequences that must be avoided in the random obfuscation header.
 var forbidden = [][]byte{
-	{0x50, 0x56, 0x72, 0x47},             // PVrG (client handshake replay)
-	{0x47, 0x45, 0x54},                   // GET
-	{0x50, 0x4f, 0x53, 0x54},             // POST
-	{0xee, 0xee, 0xee, 0xee},             // Intermediate tag prefix (reserved)
-	{0xef, 0xef, 0xef, 0xef},             // Abridged tag prefix (reserved)
+	{0x50, 0x56, 0x72, 0x47}, // PVrG
+	{0x47, 0x45, 0x54},       // GET
+	{0x50, 0x4f, 0x53, 0x54}, // POST
+	{0xee, 0xee, 0xee, 0xee}, // Intermediate tag
 }
 
 // ObfuscatedTransport wraps a WebSocket connection with MTProto obfuscation.
@@ -46,21 +44,22 @@ func NewTransport() *ObfuscatedTransport {
 }
 
 // initHeader generates the 64-byte obfuscation header and initializes
-// the AES-CTR encrypt/decrypt streams.
+// the AES-CTR encrypt/decrypt streams (MTProto obfuscated2 algorithm).
 func (t *ObfuscatedTransport) initHeader() []byte {
 	for {
 		n := make([]byte, 64)
 		rand.Read(n)
 
-		// Reject any header whose first byte matches a known protocol identifier
-		// or our own obfuscation tag (which lives at bytes 56-59, not 0-3).
-		if n[0] == 0xEF || n[0] == 0xEE {
+		// First byte must not be 0xEF (would look like a raw Abridged tag)
+		if n[0] == 0xEF {
 			continue
 		}
+		// Bytes 4-7 must not all be zero
 		if n[4] == 0 && n[5] == 0 && n[6] == 0 && n[7] == 0 {
 			continue
 		}
 
+		// Reject forbidden prefixes
 		skip := false
 		for _, f := range forbidden {
 			match := true
@@ -85,7 +84,7 @@ func (t *ObfuscatedTransport) initHeader() []byte {
 		encIV := make([]byte, 16)
 		copy(encIV, n[40:56])
 
-		// rev = n[8:56] reversed
+		// dec_key/iv = reverse of n[8:56]
 		rev := make([]byte, 48)
 		for i := 0; i < 48; i++ {
 			rev[i] = n[8+47-i]
@@ -96,21 +95,24 @@ func (t *ObfuscatedTransport) initHeader() []byte {
 		enc := NewAESCTR(encKey, encIV)
 		dec := NewAESCTR(decKey, decIV)
 
+		// Write protocol tag at bytes 56-59
 		copy(n[56:60], obfuscateTag)
 
+		// Encrypt all 64 bytes; take only the last 8 encrypted bytes
 		encrypted := enc.Update(n)
 		copy(n[56:64], encrypted[56:64])
 
+		// Advance the real encrypt stream past the 64-byte header
 		t.encrypt = NewAESCTR(encKey, encIV)
-		t.encrypt.Update(make([]byte, 64)) // skip first 64 bytes
+		t.encrypt.Update(make([]byte, 64))
 		t.decrypt = dec
 
 		return n
 	}
 }
 
-// Connect establishes a WebSocket connection to Soroush and performs the
-// obfuscation handshake.
+// Connect establishes a WebSocket connection to Soroush and performs
+// the MTProto obfuscated2 handshake. Mirrors the working relay exactly.
 func (t *ObfuscatedTransport) Connect(ctx context.Context) error {
 	log.Printf("[Transport] Connecting to Soroush WebSocket %s...", WsURI)
 
@@ -119,25 +121,18 @@ func (t *ObfuscatedTransport) Connect(ctx context.Context) error {
 	}
 
 	opts := &websocket.DialOptions{
-		// v1.mtproto signals the Soroush edge proxy to use WS-framed MTProto.
-		// Without it the proxy may drop into raw TCP mode, corrupting framing.
-		Subprotocols: []string{"binary", "v1.mtproto"},
+		Subprotocols: []string{"binary"},
 		HTTPHeader: http.Header{
 			"Origin":          {WsOrigin},
 			"User-Agent":      {WsUA},
 			"Accept-Language": {"fa-IR,fa;q=0.9,en;q=0.8"},
 			"Cache-Control":   {"no-cache"},
-			"Pragma":          {"no-cache"},
 		},
 		HTTPClient: &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig: tlsConfig,
 			},
 		},
-		// CRITICAL: disabling deflate prevents RSV1 being set on compressed frames.
-		// When compression is active, Soroush's proxy sees RSV1=1 and treats it
-		// as a raw TCP obfuscation byte, corrupting the entire stream.
-		CompressionMode: websocket.CompressionDisabled,
 	}
 
 	ws, _, err := websocket.Dial(ctx, WsURI, opts)
@@ -170,14 +165,28 @@ func (t *ObfuscatedTransport) Disconnect() {
 	}
 }
 
-// Send encrypts and sends a payload over the obfuscated WebSocket.
-// Uses MTProto Intermediate framing: 4-byte LE length (in bytes) + payload.
-// This matches the 0xeeeeeeee protocol tag sent in the obfuscation header.
+// Send encrypts and sends a payload using MTProto Abridged framing.
+// Length is encoded as len/4 in 1 byte (or 4 bytes with 0x7f prefix for large).
+// Payload MUST be a multiple of 4 bytes (MTProto requirement for Abridged).
 func (t *ObfuscatedTransport) Send(ctx context.Context, payload []byte) error {
-	// Intermediate protocol: 4-byte little-endian length (bytes) + payload
-	frame := make([]byte, 4+len(payload))
-	binary.LittleEndian.PutUint32(frame[0:4], uint32(len(payload)))
-	copy(frame[4:], payload)
+	if len(payload)%4 != 0 {
+		return fmt.Errorf("payload not multiple of 4: %d", len(payload))
+	}
+
+	n := len(payload) / 4
+	var frame []byte
+	if n < 0x7F {
+		frame = make([]byte, 1+len(payload))
+		frame[0] = byte(n)
+		copy(frame[1:], payload)
+	} else {
+		frame = make([]byte, 4+len(payload))
+		frame[0] = 0x7F
+		frame[1] = byte(n & 0xFF)
+		frame[2] = byte((n >> 8) & 0xFF)
+		frame[3] = byte((n >> 16) & 0xFF)
+		copy(frame[4:], payload)
+	}
 
 	encrypted := t.encrypt.Update(frame)
 
@@ -186,8 +195,7 @@ func (t *ObfuscatedTransport) Send(ctx context.Context, payload []byte) error {
 	return t.ws.Write(ctx, websocket.MessageBinary, encrypted)
 }
 
-// Recv reads and decrypts a payload from the obfuscated WebSocket.
-// Uses MTProto Intermediate framing: 4-byte LE length (in bytes) + payload.
+// Recv reads and decrypts a payload using MTProto Abridged framing.
 func (t *ObfuscatedTransport) Recv(ctx context.Context) ([]byte, error) {
 	_, raw, err := t.ws.Read(ctx)
 	if err != nil {
@@ -196,32 +204,24 @@ func (t *ObfuscatedTransport) Recv(ctx context.Context) ([]byte, error) {
 
 	decrypted := t.decrypt.Update(raw)
 
-	// Intermediate protocol: first 4 bytes are the payload length (LE)
-	if len(decrypted) < 4 {
-		// If exactly 4 bytes, it's a server error code (negative int32)
-		if len(decrypted) == 4 {
-			code := int32(binary.LittleEndian.Uint32(decrypted))
-			return nil, fmt.Errorf("transport error code: %d", code)
+	if len(decrypted) == 0 {
+		return nil, fmt.Errorf("transport: received empty frame")
+	}
+
+	first := decrypted[0]
+	var payload []byte
+	if first == 0x7F {
+		if len(decrypted) < 4 {
+			return nil, fmt.Errorf("transport: long frame too short: %d", len(decrypted))
 		}
-		return nil, fmt.Errorf("transport: frame too short: %d bytes", len(decrypted))
+		payload = decrypted[4:]
+	} else {
+		payload = decrypted[1:]
 	}
 
-	payloadLen := int(binary.LittleEndian.Uint32(decrypted[0:4]))
-
-	// Negative-looking length = server error code sent before the length header
-	if payloadLen > len(decrypted)-4 {
-		log.Printf("[Transport] WARN: claimed payloadLen=%d but frame only has %d bytes; raw frame may be an error", payloadLen, len(decrypted)-4)
-		payloadLen = len(decrypted) - 4
-	}
-
-	payload := decrypted[4 : 4+payloadLen]
-
-	// Check for 4-byte server error codes embedded in the payload
 	if len(payload) == 4 {
 		code := int32(binary.LittleEndian.Uint32(payload))
-		if code < 0 {
-			return nil, fmt.Errorf("transport error code: %d", code)
-		}
+		return nil, fmt.Errorf("transport error code: %d", code)
 	}
 
 	return payload, nil
